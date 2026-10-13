@@ -87,6 +87,15 @@ Facts that shape the design:
    - README with setup steps.
    - **Status:** (a) layout applied without SDC_SAVE_TO_DATABASE (needs e2e confirmation), leftover-layout warning at start; (b) IOCTL timing logged, wait logic matches the header, ADD latency looks driver-side; (c) WM_DISPLAYCHANGE health check (debounced) stops the session + balloon; (d) resume restarts a running session; (e) live swap via `Arc<AtomicBool>`; (f) shader stretch path per half; (g) README written. Also: new targets are detected via QDC_ALL_PATHS and explicitly activated (auto-wait, then SDC_TOPOLOGY_EXTEND, then manual path injection); stop removes the virtual displays BEFORE restoring the layout. NOT run end-to-end.
 
+### E2E results (orchestrator, 2026-10-13, FlipGo-H on HDMI tall mode)
+
+- [x] Phase 0 spike: `vdd_probe` as non-admin PASSED. Targets: "ParsecVDA", `DISPLAY#PSCCDD0#...UID256/257`, 1920x1080. Parsec backend kept; MttVDD not needed.
+- [x] Bug found and fixed: the first stop restored the layout with SDC_SAVE_TO_DATABASE while the virtual displays were still attached, which persisted "virtuals inactive" for the 4-monitor set. Fixed with explicit activation (EXTEND, then manual injection), remove-before-restore and no DB save.
+- [x] Bug found and fixed: `CreateForMonitor` E_INVALIDARG right after the layout change. Fixed by the settle/retry loop; it succeeds on the 2nd attempt.
+- [x] Full session for 120 s with the user watching: two separate desktops on the panels; cursor moves Asus → top → bottom and through the portal; YouTube fullscreen fills one panel; maximize and Win+arrows stay per panel. User confirmed all four.
+- [x] Crash safety: force-killed mid-split. Within 6 s the virtual displays were gone and the FlipGo was back at (-1920,0). Not persisted, so (a) is confirmed.
+- [ ] Not run yet: tray app (release build), Swap live, autostart toggle, second-instance box, lock/unlock and UAC with the portal, sleep/resume, unplug during split, stretch path.
+
 Commit after each phase on a branch `flipgo-virtual-split` (the repo is on `master`, remote `Tihi321/virtual-desktop-display`).
 
 ## Verification
