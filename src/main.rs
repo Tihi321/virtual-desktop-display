@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! Default: tray application. `--cli`: console mode (Ctrl+C to stop).
+//! Default: tray application. `--settings`: the settings window (own process).
+//! `--cli`: console mode (Ctrl+C to stop).
 //! `--seconds N` (implies `--cli`): stop automatically after N seconds.
 //! `--register-modes "WxH@HZ,..."`: elevated helper that writes the Parsec VDD
 //! custom modes to HKLM and exits (exit code 0 = success).
@@ -8,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use vdd_app::{config::Config, displays, modes, session, session::Session, set_dpi_aware, tray};
+use vdd_app::{
+    config::Config, displays, modes, session, session::Session, set_dpi_aware, tray, ui,
+};
 use windows::core::{w, BOOL};
 use windows::Win32::Foundation::GENERIC_WRITE;
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
@@ -20,7 +23,6 @@ use windows::Win32::System::Console::{
     STD_ERROR_HANDLE,
 };
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -111,27 +113,34 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
-    // Single instance.
+    // Settings window: its own process and its own single-instance mutex.
+    if args.iter().any(|a| a == "--settings") {
+        tracing::info!(
+            "settings mode started, version {}",
+            env!("CARGO_PKG_VERSION")
+        );
+        return ui::run_settings();
+    }
+
+    // Single instance. A second tray launch opens the settings window instead.
     let _mutex: HANDLE = unsafe { CreateMutexW(None, true, w!("Local\\VirtualDesktopDisplay"))? };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        tracing::warn!("another instance is already running");
-        unsafe {
-            MessageBoxW(
-                None,
-                w!("Virtual Desktop Display is already running (see the tray icon)."),
-                w!("Virtual Desktop Display"),
-                MB_OK | MB_ICONINFORMATION,
-            );
+        if cli {
+            tracing::error!("another instance is already running");
+            return Ok(());
         }
-        return Ok(());
+        tracing::info!("another instance is already running; opening settings");
+        return ui::run_settings();
     }
+    // No config file yet: the tray opens the settings window right away.
+    let first_run = Config::path().is_none_or(|p| !p.exists());
 
     let cfg = Config::load();
     tracing::info!("config: {cfg:?}");
 
     if !cli {
         tracing::info!("tray mode started, version {}", env!("CARGO_PKG_VERSION"));
-        return tray::run(cfg);
+        return tray::run(cfg, first_run);
     }
 
     unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), true)? };

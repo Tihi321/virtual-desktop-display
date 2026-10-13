@@ -1,8 +1,13 @@
 //! Tray application: a hidden top-level window owns the notification icon,
-//! the context menu and the system notifications (display change, power).
+//! the context menu, the hotkeys, the IPC messages from the settings process
+//! and the system notifications (display / device change, power).
+use crate::autosplit::{self, Action as AutoAction, AutoState};
 use crate::autostart;
 use crate::capture::init_winrt;
 use crate::config::Config;
+use crate::driver;
+use crate::hotkeys::{self, Registration};
+use crate::ipc::{self, Msg, StatusFile};
 use crate::session_worker::{Command, SessionWorker, Status, WM_WORKER_STATUS};
 use anyhow::{anyhow, Result};
 use std::cell::{Cell, RefCell};
@@ -11,32 +16,38 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO,
-    NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, LoadIconW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
-    TrackPopupMenu, TranslateMessage, HICON, IDI_APPLICATION, MF_CHECKED, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, MSG, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND,
-    WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NULL,
-    WM_POWERBROADCAST, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow,
+    SetMenuDefaultItem, SetTimer, TrackPopupMenu, TranslateMessage, HICON, IDI_APPLICATION,
+    MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON,
+    WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DEVICECHANGE, WM_DISPLAYCHANGE,
+    WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP, WM_TIMER,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_START_INITIAL: u32 = WM_APP + 2;
+const WM_OPEN_SETTINGS: u32 = WM_APP + 3;
 
-const ID_TOGGLE: usize = 1001;
-const ID_CYCLE: usize = 1002;
-const ID_OPEN_CONFIG: usize = 1003;
-const ID_RELOAD: usize = 1004;
-const ID_AUTOSTART: usize = 1005;
-const ID_EXIT: usize = 1006;
+const ID_SETTINGS: usize = 1001;
+const ID_TOGGLE: usize = 1002;
+const ID_CYCLE: usize = 1003;
+const ID_AUTOSTART: usize = 1004;
+const ID_EXIT: usize = 1005;
+/// Per-split items: `ID_SPLIT_BASE + config index`.
+const ID_SPLIT_BASE: usize = 2000;
 
+/// Debounce for display / device change bursts (also re-armed while the worker is busy).
 const TIMER_DISPLAY: usize = 1;
 const TIMER_RESUME: usize = 2;
+const DEBOUNCE_MS: u32 = 1500;
 
+const DBT_DEVNODES_CHANGED: usize = 0x0007;
 const PBT_APMSUSPEND: usize = 0x4;
 const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
 const PBT_APMRESUMESUSPEND: usize = 0x7;
@@ -51,6 +62,13 @@ struct App {
     /// The session was running when the machine went to sleep.
     resume_restart: Cell<bool>,
     taskbar_created: Cell<u32>,
+    /// Registered window message ids (Reload, StartAll, StopAll, OpenSettings).
+    msgs: [Cell<u32>; 4],
+    auto: RefCell<AutoState>,
+    /// Per split: its display is connected (last evaluation).
+    present: RefCell<Vec<bool>>,
+    hotkeys: RefCell<Vec<Registration>>,
+    driver: Cell<driver::DriverStatus>,
 }
 
 thread_local! {
@@ -150,16 +168,119 @@ fn balloon(app: &App, title: &str, text: &str, warning: bool) {
     }
 }
 
-fn start_session(app: &App) {
+// ---- status.json -------------------------------------------------------------
+
+fn write_status(app: &App) {
+    let st = status(app);
+    let cfg = app.cfg.borrow();
+    let present = app.present.borrow();
+    let running_set: Vec<usize> = match &st {
+        Status::Running { splits } => splits.clone(),
+        _ => Vec::new(),
+    };
+    let (state, message) = match &st {
+        Status::Idle => ("idle", String::new()),
+        Status::Starting => ("starting", String::new()),
+        Status::Running { splits } => ("running", format!("{} split(s) running", splits.len())),
+        Status::Stopping => ("stopping", String::new()),
+        Status::Error(m) => ("error", m.clone()),
+    };
+    let d = app.driver.get();
+    let s = StatusFile {
+        running: matches!(st, Status::Running { .. }),
+        state: state.into(),
+        message,
+        splits: cfg
+            .splits
+            .iter()
+            .enumerate()
+            .map(|(i, sc)| ipc::SplitStatus {
+                index: i,
+                name: sc.name.clone(),
+                running: running_set.contains(&i),
+                display_present: present.get(i).copied().unwrap_or(false),
+            })
+            .collect(),
+        hotkeys: app
+            .hotkeys
+            .borrow()
+            .iter()
+            .map(|r| ipc::HotkeyStatus {
+                action: r.action.key().into(),
+                keys: r.keys.clone(),
+                enabled: r.enabled,
+                registered: r.registered,
+                error: r.error.clone(),
+            })
+            .collect(),
+        driver: ipc::DriverInfo {
+            installed: d.installed,
+            version: d.version,
+        },
+        updated_at: ipc::now_unix(),
+    };
+    if let Err(e) = ipc::write_status(&s) {
+        tracing::warn!("could not write status.json: {e:#}");
+    }
+}
+
+/// Re-probe the driver, but never while a session may hold or be opening it.
+fn refresh_driver(app: &App) {
+    if matches!(status(app), Status::Idle | Status::Error(_)) {
+        app.driver.set(driver::status());
+    }
+}
+
+fn refresh_presence(app: &App) -> Vec<bool> {
+    let p = autosplit::current_presence(&app.cfg.borrow());
+    *app.present.borrow_mut() = p.clone();
+    p
+}
+
+// ---- actions -----------------------------------------------------------------
+
+/// Start (or restart) with the splits the auto state wants running.
+fn apply_desired(app: &App) {
+    let cfg = app.cfg.borrow().clone();
+    let present = refresh_presence(app);
+    let desired = app.auto.borrow().desired(&cfg, &present);
+    if desired.is_empty() {
+        if is_active(app) {
+            send(app, Command::Stop);
+        }
+        return;
+    }
+    send(
+        app,
+        Command::Start(Box::new(autosplit::config_for(&cfg, &desired))),
+    );
+}
+
+/// Explicit start: all enabled splits whose display is connected.
+fn start_all(app: &App) {
     if is_active(app) {
         return;
     }
     let cfg = app.cfg.borrow().clone();
+    app.auto.borrow_mut().arm_all(&cfg);
+    refresh_presence(app);
+    // The worker resolves the enabled splits itself and reports a clear
+    // error if none of the displays is connected.
     send(app, Command::Start(Box::new(cfg)));
 }
 
-fn stop_session(app: &App) {
+fn stop_all(app: &App) {
+    // A manual stop pauses auto-start until the displays are replugged.
+    app.auto.borrow_mut().disarm_all();
     send(app, Command::Stop);
+}
+
+fn toggle_all(app: &App) {
+    if is_active(app) {
+        stop_all(app);
+    } else {
+        start_all(app);
+    }
 }
 
 /// Stop the session and end the worker thread, waiting for it (exit paths).
@@ -168,6 +289,21 @@ fn shutdown_worker(app: &App) {
     if let Some(w) = w {
         w.shutdown();
     }
+    hotkeys::unregister_all(app.hwnd.get());
+}
+
+fn open_settings() {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("cannot find own exe: {e}");
+            return;
+        }
+    };
+    // A second settings process just brings the existing window to the front.
+    if let Err(e) = std::process::Command::new(exe).arg("--settings").spawn() {
+        tracing::error!("could not launch settings: {e}");
+    }
 }
 
 fn show_menu(app: &App) {
@@ -175,21 +311,40 @@ fn show_menu(app: &App) {
         let Ok(menu) = CreatePopupMenu() else { return };
         let running = is_active(app);
         let check = |b: bool| if b { MF_CHECKED } else { MF_UNCHECKED };
-        let toggle = wide(if running {
-            "Stop splits"
-        } else {
-            "Start splits"
-        });
+        let settings = wide("Settings...");
+        let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, PCWSTR(settings.as_ptr()));
+        let _ = SetMenuDefaultItem(menu, ID_SETTINGS as u32, 0);
+        {
+            let cfg = app.cfg.borrow();
+            let present = app.present.borrow();
+            if !cfg.splits.is_empty() {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            }
+            for (i, sc) in cfg.splits.iter().enumerate() {
+                let mut label = if sc.name.trim().is_empty() {
+                    format!("Split {}", i + 1)
+                } else {
+                    sc.name.clone()
+                };
+                if !present.get(i).copied().unwrap_or(false) {
+                    label.push_str(" (not connected)");
+                }
+                let l = wide(&label);
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING | check(sc.enabled),
+                    ID_SPLIT_BASE + i,
+                    PCWSTR(l.as_ptr()),
+                );
+            }
+        }
+        let toggle = wide(if running { "Stop all" } else { "Start all" });
         let cycle = wide("Cycle pieces");
-        let open = wide("Open config");
-        let reload = wide("Reload config");
         let auto = wide("Start with Windows");
         let exit = wide("Exit");
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE, PCWSTR(toggle.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, ID_CYCLE, PCWSTR(cycle.as_ptr()));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, PCWSTR(open.as_ptr()));
-        let _ = AppendMenuW(menu, MF_STRING, ID_RELOAD, PCWSTR(reload.as_ptr()));
         let _ = AppendMenuW(
             menu,
             MF_STRING | check(autostart::is_enabled()),
@@ -218,25 +373,31 @@ fn show_menu(app: &App) {
     }
 }
 
-fn open_config(app: &App) {
-    let Some(path) = Config::path() else { return };
-    if !path.exists() {
-        if let Err(e) = app.cfg.borrow().save() {
-            tracing::error!("could not create config: {e:#}");
+/// Toggle `enabled` of one split from the menu, save, and apply when running.
+fn toggle_split(app: &App, index: usize) {
+    let now_enabled = {
+        let mut cfg = app.cfg.borrow_mut();
+        let Some(sc) = cfg.splits.get_mut(index) else {
             return;
+        };
+        sc.enabled = !sc.enabled;
+        if let Err(e) = cfg.save() {
+            tracing::warn!("could not save config: {e:#}");
         }
+        cfg.splits[index].enabled
+    };
+    if now_enabled {
+        app.auto.borrow_mut().arm(index);
     }
-    let arg = wide(&format!("\"{}\"", path.display()));
-    unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            w!("notepad.exe"),
-            PCWSTR(arg.as_ptr()),
-            None,
-            SW_SHOWNORMAL,
-        );
+    if is_active(app) {
+        apply_desired(app);
     }
+    write_status(app);
+}
+
+fn register_hotkeys(app: &App) {
+    let regs = hotkeys::register_all(app.hwnd.get(), &app.cfg.borrow().hotkeys);
+    *app.hotkeys.borrow_mut() = regs;
 }
 
 fn reload_config(app: &App) {
@@ -246,10 +407,16 @@ fn reload_config(app: &App) {
         tracing::warn!("autostart sync failed: {e:#}");
     }
     *app.cfg.borrow_mut() = new.clone();
-    // The worker restarts a running session with the new config.
+    register_hotkeys(app);
+    let present = refresh_presence(app);
+    *app.auto.borrow_mut() = AutoState::new(&new, &present, false);
+    refresh_driver(app);
+    // A running session restarts with the new config (all enabled splits).
     if is_active(app) {
-        send(app, Command::Start(Box::new(new)));
+        app.auto.borrow_mut().arm_all(&new);
+        apply_desired(app);
     }
+    write_status(app);
 }
 
 fn cycle_pieces(app: &App) {
@@ -258,8 +425,8 @@ fn cycle_pieces(app: &App) {
     }
 }
 
-/// React to a worker status change: tooltip, balloon on errors, and persist
-/// the piece orders after a cycle.
+/// React to a worker status change: tooltip, balloon on errors, persist the
+/// piece orders after a cycle, status.json.
 fn on_worker_status(app: &App) {
     let st = status(app);
     if *app.last_status.borrow() == st {
@@ -267,11 +434,16 @@ fn on_worker_status(app: &App) {
     }
     *app.last_status.borrow_mut() = st.clone();
     update_tip(app);
-    match st {
-        Status::Error(msg) => balloon(app, "Split stopped", &msg, true),
+    match &st {
+        Status::Error(msg) => {
+            app.auto.borrow_mut().note_failure();
+            balloon(app, "Split stopped", msg, true);
+        }
         Status::Running { .. } => persist_orders(app),
         _ => {}
     }
+    refresh_driver(app);
+    write_status(app);
 }
 
 /// Save the worker's current piece orders into the config if they changed.
@@ -313,9 +485,68 @@ fn toggle_autostart(app: &App) {
     }
 }
 
+/// The debounced display / device change: auto-split decision, then the
+/// health check of a running session.
+fn on_display_settled(app: &App, hwnd: HWND) {
+    let st = status(app);
+    if matches!(st, Status::Starting | Status::Stopping) {
+        // Our own layout changes; look again once the worker is done.
+        unsafe {
+            SetTimer(Some(hwnd), TIMER_DISPLAY, DEBOUNCE_MS, None);
+        }
+        return;
+    }
+    let cfg = app.cfg.borrow().clone();
+    let present = refresh_presence(app);
+    let running: Vec<usize> = match &st {
+        Status::Running { splits } => splits.clone(),
+        _ => Vec::new(),
+    };
+    let action = autosplit::decide(&mut app.auto.borrow_mut(), &running, &present, &cfg);
+    match action {
+        AutoAction::Nothing => check_health(app),
+        AutoAction::Stop => {
+            tracing::info!("auto-split: no split display left; stopping");
+            send(app, Command::Stop);
+            balloon(
+                app,
+                "Split stopped",
+                "A split display was disconnected; the layout was restored.",
+                false,
+            );
+        }
+        AutoAction::Restart(set) => {
+            tracing::info!("auto-split: restarting with splits {set:?}");
+            send(
+                app,
+                Command::Start(Box::new(autosplit::config_for(&cfg, &set))),
+            );
+        }
+    }
+    write_status(app);
+}
+
 fn check_health(app: &App) {
     if matches!(status(app), Status::Running { .. }) {
         send(app, Command::CheckHealth);
+    }
+}
+
+fn on_hotkey(app: &App, id: i32) {
+    match hotkeys::Action::from_id(id) {
+        Some(hotkeys::Action::ToggleAll) => toggle_all(app),
+        Some(hotkeys::Action::CycleOrder) => cycle_pieces(app),
+        Some(hotkeys::Action::OpenSettings) => open_settings(),
+        None => {}
+    }
+}
+
+fn on_ipc(app: &App, which: usize) {
+    match which {
+        0 => reload_config(app),
+        1 => start_all(app),
+        2 => stop_all(app),
+        _ => open_settings(),
     }
 }
 
@@ -326,41 +557,41 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_TRAY => {
             match (lp.0 as u32) & 0xFFFF {
-                WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(&app),
-                WM_LBUTTONDBLCLK => {
-                    if is_active(&app) {
-                        stop_session(&app);
-                    } else {
-                        start_session(&app);
-                    }
+                WM_RBUTTONUP | WM_CONTEXTMENU => {
+                    refresh_presence(&app);
+                    show_menu(&app);
                 }
+                WM_LBUTTONDBLCLK => open_settings(),
                 _ => {}
             }
             LRESULT(0)
         }
         WM_COMMAND => {
-            match wp.0 & 0xFFFF {
-                ID_TOGGLE => {
-                    if is_active(&app) {
-                        stop_session(&app);
-                    } else {
-                        start_session(&app);
-                    }
-                }
+            let id = wp.0 & 0xFFFF;
+            match id {
+                ID_SETTINGS => open_settings(),
+                ID_TOGGLE => toggle_all(&app),
                 ID_CYCLE => cycle_pieces(&app),
-                ID_OPEN_CONFIG => open_config(&app),
-                ID_RELOAD => reload_config(&app),
                 ID_AUTOSTART => toggle_autostart(&app),
                 ID_EXIT => {
                     shutdown_worker(&app);
                     let _ = DestroyWindow(hwnd);
                 }
+                i if i >= ID_SPLIT_BASE => toggle_split(&app, i - ID_SPLIT_BASE),
                 _ => {}
             }
             LRESULT(0)
         }
+        WM_HOTKEY => {
+            on_hotkey(&app, wp.0 as i32);
+            LRESULT(0)
+        }
         WM_START_INITIAL => {
-            start_session(&app);
+            apply_desired(&app);
+            LRESULT(0)
+        }
+        WM_OPEN_SETTINGS => {
+            open_settings();
             LRESULT(0)
         }
         WM_WORKER_STATUS => {
@@ -369,23 +600,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DISPLAYCHANGE => {
             // Debounce: our own mode/layout changes and driver (un)plugging
-            // produce bursts. The check validates the actual target set.
-            SetTimer(Some(hwnd), TIMER_DISPLAY, 1500, None);
+            // produce bursts.
+            SetTimer(Some(hwnd), TIMER_DISPLAY, DEBOUNCE_MS, None);
             LRESULT(0)
+        }
+        WM_DEVICECHANGE => {
+            if wp.0 == DBT_DEVNODES_CHANGED {
+                SetTimer(Some(hwnd), TIMER_DISPLAY, DEBOUNCE_MS, None);
+            }
+            LRESULT(1)
         }
         WM_TIMER => {
             match wp.0 {
                 TIMER_DISPLAY => {
                     let _ = KillTimer(Some(hwnd), TIMER_DISPLAY);
-                    check_health(&app);
+                    on_display_settled(&app, hwnd);
                 }
                 TIMER_RESUME => {
                     let _ = KillTimer(Some(hwnd), TIMER_RESUME);
                     if app.resume_restart.replace(false) {
                         tracing::info!("resume: restarting session");
                         // Queued behind the Stop sent on resume, so order is safe.
-                        let cfg = app.cfg.borrow().clone();
-                        send(&app, Command::Start(Box::new(cfg)));
+                        apply_desired(&app);
                     }
                 }
                 _ => {}
@@ -406,7 +642,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     // The virtual displays vanished while the keep-alive was
                     // frozen; tear the stale session down, then start fresh.
                     tracing::info!("resume: dropping stale session");
-                    stop_session(&app);
+                    send(&app, Command::Stop);
                     SetTimer(Some(hwnd), TIMER_RESUME, 4000, None);
                 }
                 _ => {}
@@ -429,34 +665,49 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             add_tray_icon(&app);
             LRESULT(0)
         }
+        m if m != 0 && app.msgs.iter().any(|c| c.get() == m) => {
+            let which = app.msgs.iter().position(|c| c.get() == m).unwrap_or(0);
+            on_ipc(&app, which);
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
 
-/// Run the tray application until Exit.
-pub fn run(cfg: Config) -> Result<()> {
+/// Run the tray application until Exit. `first_run`: no config file existed;
+/// the settings window opens right away.
+pub fn run(cfg: Config, first_run: bool) -> Result<()> {
     init_winrt();
     let start_on_launch = cfg.start_on_launch;
-    let has_splits = !cfg.splits.is_empty();
     let autostart_wanted = cfg.autostart;
+    let present = autosplit::current_presence(&cfg);
+    let auto = AutoState::new(&cfg, &present, start_on_launch);
     let app = Rc::new(App {
         hwnd: Cell::new(HWND::default()),
+        auto: RefCell::new(auto),
+        present: RefCell::new(present),
         cfg: RefCell::new(cfg),
         worker: RefCell::new(None),
         last_status: RefCell::new(Status::Idle),
         resume_restart: Cell::new(false),
         taskbar_created: Cell::new(0),
+        msgs: Default::default(),
+        hotkeys: RefCell::new(Vec::new()),
+        driver: Cell::new(driver::DriverStatus {
+            installed: false,
+            version: None,
+            adapter_present: false,
+        }),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
     unsafe {
         let hinst = GetModuleHandleW(None)?;
-        let class = w!("VirtualDesktopDisplayTray");
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wndproc),
             hInstance: hinst.into(),
-            lpszClassName: class,
+            lpszClassName: ipc::TRAY_CLASS,
             ..Default::default()
         };
         if RegisterClassExW(&wc) == 0 {
@@ -464,10 +715,17 @@ pub fn run(cfg: Config) -> Result<()> {
         }
         app.taskbar_created
             .set(RegisterWindowMessageW(w!("TaskbarCreated")));
+        for (c, m) in
+            app.msgs
+                .iter()
+                .zip([Msg::Reload, Msg::StartAll, Msg::StopAll, Msg::OpenSettings])
+        {
+            c.set(m.id());
+        }
         // Top-level (not message-only) so it receives broadcast messages.
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW,
-            class,
+            ipc::TRAY_CLASS,
             w!("Virtual Desktop Display"),
             WS_POPUP,
             0,
@@ -482,13 +740,19 @@ pub fn run(cfg: Config) -> Result<()> {
         app.hwnd.set(hwnd);
         *app.worker.borrow_mut() = Some(SessionWorker::for_hwnd(hwnd.0 as isize)?);
         add_tray_icon(&app);
+        register_hotkeys(&app);
+        app.driver.set(driver::status());
+        write_status(&app);
         // Only ensure the entry exists; never delete it implicitly at startup.
         if autostart_wanted {
             if let Err(e) = autostart::set_enabled(true) {
                 tracing::warn!("autostart sync failed: {e:#}");
             }
         }
-        if start_on_launch && has_splits {
+        if first_run {
+            let _ = PostMessageW(Some(hwnd), WM_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+        }
+        if start_on_launch {
             let _ = PostMessageW(Some(hwnd), WM_START_INITIAL, WPARAM(0), LPARAM(0));
         }
         let mut msg = MSG::default();
