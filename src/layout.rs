@@ -57,6 +57,65 @@ impl LayoutPlan {
     }
 }
 
+/// Rects of the virtual displays when their real sizes may differ from the
+/// pieces (a piece without an exact mode gets a larger fallback mode).
+///
+/// Behaviour: the pieces' grid structure (distinct x / y starts) is kept, but
+/// every column is as wide as its widest actual display and every row as high
+/// as its tallest, so differently sized displays never overlap. With exact
+/// sizes the result equals `pieces` (the grid starts at the first piece).
+/// `actual[i]` is the (w, h) of piece i's virtual display.
+pub fn tile_virtual(pieces: &[Rect], actual: &[(i32, i32)]) -> Vec<Rect> {
+    if pieces.len() != actual.len() || pieces.is_empty() {
+        return pieces.to_vec();
+    }
+    let mut xs: Vec<i32> = pieces.iter().map(|p| p.x).collect();
+    let mut ys: Vec<i32> = pieces.iter().map(|p| p.y).collect();
+    xs.sort_unstable();
+    xs.dedup();
+    ys.sort_unstable();
+    ys.dedup();
+    let col_w: Vec<i32> = xs
+        .iter()
+        .map(|x| {
+            pieces
+                .iter()
+                .zip(actual)
+                .filter(|(p, _)| p.x == *x)
+                .map(|(_, a)| a.0)
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let row_h: Vec<i32> = ys
+        .iter()
+        .map(|y| {
+            pieces
+                .iter()
+                .zip(actual)
+                .filter(|(p, _)| p.y == *y)
+                .map(|(_, a)| a.1)
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let (x0, y0) = (xs[0], ys[0]);
+    pieces
+        .iter()
+        .zip(actual)
+        .map(|(p, a)| {
+            let ci = xs.iter().position(|x| *x == p.x).unwrap_or(0);
+            let ri = ys.iter().position(|y| *y == p.y).unwrap_or(0);
+            Rect::new(
+                x0 + col_w[..ci].iter().sum::<i32>(),
+                y0 + row_h[..ri].iter().sum::<i32>(),
+                a.0,
+                a.1,
+            )
+        })
+        .collect()
+}
+
 /// Edge contact or overlap (closed intervals).
 fn touches(a: &Rect, b: &Rect) -> bool {
     a.x <= b.right() && b.x <= a.right() && a.y <= b.bottom() && b.y <= a.bottom()
@@ -435,5 +494,34 @@ mod tests {
                 (key(1), (0, 0)),
             ]
         );
+    }
+
+    #[test]
+    fn tile_virtual_exact_sizes_equal_pieces() {
+        let ps = vec![Rect::new(0, 0, 1720, 1440), Rect::new(1720, 0, 1720, 1440)];
+        let act: Vec<(i32, i32)> = ps.iter().map(|p| (p.w, p.h)).collect();
+        assert_eq!(tile_virtual(&ps, &act), ps);
+    }
+
+    #[test]
+    fn tile_virtual_fallback_sizes_do_not_overlap() {
+        // 2x2 grid; piece 0 got a larger fallback mode.
+        let ps = vec![
+            Rect::new(0, 0, 1720, 720),
+            Rect::new(1720, 0, 1720, 720),
+            Rect::new(0, 720, 1720, 720),
+            Rect::new(1720, 720, 1720, 720),
+        ];
+        let act = vec![(2560, 1440), (1720, 720), (1720, 720), (1720, 720)];
+        let t = tile_virtual(&ps, &act);
+        assert_eq!(t[0], Rect::new(0, 0, 2560, 1440));
+        assert_eq!(t[1], Rect::new(2560, 0, 1720, 720));
+        assert_eq!(t[2], Rect::new(0, 1440, 1720, 720));
+        assert_eq!(t[3], Rect::new(2560, 1440, 1720, 720));
+        for i in 0..t.len() {
+            for j in i + 1..t.len() {
+                assert!(!t[i].intersects(&t[j]), "{i} overlaps {j}");
+            }
+        }
     }
 }

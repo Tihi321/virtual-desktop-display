@@ -1,16 +1,23 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //! Default: tray application. `--cli`: console mode (Ctrl+C to stop).
 //! `--seconds N` (implies `--cli`): stop automatically after N seconds.
+//! `--register-modes "WxH@HZ,..."`: elevated helper that writes the Parsec VDD
+//! custom modes to HKLM and exits (exit code 0 = success).
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use vdd_app::{config::Config, displays, session, session::Session, set_dpi_aware, tray};
+use vdd_app::{config::Config, displays, modes, session, session::Session, set_dpi_aware, tray};
 use windows::core::{w, BOOL};
+use windows::Win32::Foundation::GENERIC_WRITE;
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
 use windows::Win32::System::Console::{
-    AttachConsole, GetConsoleWindow, SetConsoleCtrlHandler, ATTACH_PARENT_PROCESS,
+    AttachConsole, GetStdHandle, SetConsoleCtrlHandler, SetStdHandle, ATTACH_PARENT_PROCESS,
+    STD_ERROR_HANDLE,
 };
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
@@ -24,12 +31,14 @@ unsafe extern "system" fn ctrl_handler(_ctrl: u32) -> BOOL {
 }
 
 /// Log to stderr and to a daily rolling file in %APPDATA%\virtual-desktop-display\logs.
-fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+///
+/// `cli`: the stderr layer is always on (the console was attached by hand and
+/// `GetConsoleWindow` is not a reliable test for a console).
+fn init_logging(cli: bool) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    // Only log to stderr when a console is attached (GUI subsystem has none).
-    let has_console = !unsafe { GetConsoleWindow() }.0.is_null();
-    let stderr = has_console.then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
+    // The GUI-subsystem tray app has no console, so only `--cli` logs to stderr.
+    let stderr = cli.then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     let (file_layer, guard) = match Config::dir() {
         Some(d) => {
             let appender = tracing_appender::rolling::daily(d.join("logs"), "vdd.log");
@@ -53,6 +62,29 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     guard
 }
 
+/// A GUI-subsystem process starts with null standard handles unless they were
+/// redirected. After attaching to the parent console, point stderr at it so
+/// the log shows up there.
+fn redirect_stderr_to_console() {
+    unsafe {
+        let cur = GetStdHandle(STD_ERROR_HANDLE).unwrap_or_default();
+        if !cur.is_invalid() && !cur.0.is_null() {
+            return; // already redirected to a file/pipe by the caller
+        }
+        if let Ok(h) = CreateFileW(
+            w!("CONOUT$"),
+            GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        ) {
+            let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let seconds = args
@@ -66,9 +98,18 @@ fn main() -> Result<()> {
         unsafe {
             let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         }
+        redirect_stderr_to_console();
     }
-    let _log_guard = init_logging();
+    let _log_guard = init_logging(cli);
     set_dpi_aware(); // fallback; the manifest already requests PerMonitorV2
+
+    // Elevated helper: no tray, no mutex.
+    if let Some(i) = args.iter().position(|a| a == "--register-modes") {
+        let list = args.get(i + 1).map(String::as_str).unwrap_or("");
+        let code = modes::register_helper(list);
+        drop(_log_guard); // flush the log file
+        std::process::exit(code);
+    }
 
     // Single instance.
     let _mutex: HANDLE = unsafe { CreateMutexW(None, true, w!("Local\\VirtualDesktopDisplay"))? };

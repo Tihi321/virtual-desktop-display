@@ -16,6 +16,7 @@ use crate::cursor_portal::{CursorPortal, PortalSplit};
 use crate::displays::{self, Rect, SavedLayout, TargetInfo, TargetKey};
 use crate::geometry::{self, Spec};
 use crate::layout::{self, DisplayGeom, SplitGeom};
+use crate::modes::{self, Mode};
 use crate::renderer::{create_device, D3d, Renderer};
 use crate::vdd::parsec::{ParsecVdd, VDD_MAX_DISPLAYS};
 use crate::vdd::VirtualDisplays;
@@ -319,27 +320,49 @@ impl Session {
         let pieces: Vec<Vec<Rect>> = self.splits.iter().map(|s| s.pieces()).collect();
 
         tracing::info!("step 3: setting modes");
-        let now = displays::enumerate()?;
+        // Exact mode if the driver has it (built-in or registered right now);
+        // else the nearest larger built-in mode, which the renderer stretches.
+        let registered = modes::read_custom_modes().unwrap_or_else(|e| {
+            tracing::warn!("cannot read the custom modes: {e:#}");
+            Vec::new()
+        });
+        let mut actual: Vec<Vec<Mode>> = Vec::new();
+        // Real virtual display rects (relative to the physical origin).
+        let mut vrects: Vec<Vec<Rect>> = Vec::new();
         for (s, ps) in self.splits.iter().zip(&pieces) {
-            for (k, p) in s.virt.iter().zip(ps) {
+            let acts: Vec<Mode> = ps
+                .iter()
+                .map(|p| {
+                    let want = Mode::new(p.w as u32, p.h as u32, s.refresh);
+                    let (got, exact) = modes::actual_for(want, &registered);
+                    if !exact {
+                        tracing::warn!(
+                            "split {}: mode {want} is not registered; using {got} and stretching",
+                            s.index
+                        );
+                    }
+                    got
+                })
+                .collect();
+            let sizes: Vec<(i32, i32)> = acts.iter().map(|m| (m.w as i32, m.h as i32)).collect();
+            vrects.push(layout::tile_virtual(ps, &sizes));
+            actual.push(acts);
+        }
+        let now = displays::enumerate()?;
+        for (s, acts) in self.splits.iter().zip(&actual) {
+            for (k, m) in s.virt.iter().zip(acts) {
                 let t = now
                     .iter()
                     .find(|t| t.key == *k)
                     .ok_or_else(|| anyhow!("virtual target {k:?} not active"))?;
-                displays::set_mode(
-                    &t.gdi_name,
-                    p.w as u32,
-                    p.h as u32,
-                    s.refresh,
-                    (t.rect.x, t.rect.y),
-                )?;
+                displays::set_mode(&t.gdi_name, m.w, m.h, m.hz, (t.rect.x, t.rect.y))?;
             }
         }
 
         let geoms: Vec<SplitGeom> = self
             .splits
             .iter()
-            .zip(&pieces)
+            .zip(&vrects)
             .map(|(s, ps)| {
                 let n = ps.len();
                 SplitGeom {
@@ -359,7 +382,7 @@ impl Session {
 
         // Expected final state: positions from the plan, sizes for virtual displays.
         let mut expect: Vec<Expected> = Vec::new();
-        for ((keys, poss), ps) in virt_keys.iter().zip(&plan.virtual_positions).zip(&pieces) {
+        for ((keys, poss), ps) in virt_keys.iter().zip(&plan.virtual_positions).zip(&vrects) {
             for ((k, pos), p) in keys.iter().zip(poss).zip(ps) {
                 expect.push((*k, *pos, Some((p.w, p.h))));
             }
