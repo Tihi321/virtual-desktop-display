@@ -141,8 +141,6 @@ fn spawn_window_thread(rect: Rect) -> Result<(isize, JoinHandle<()>)> {
 
 pub struct RenderConfig {
     pub physical: Rect,
-    /// Live-toggleable: when true the lower source is drawn in the upper half.
-    pub swap: Arc<AtomicBool>,
 }
 
 pub struct Renderer {
@@ -248,7 +246,6 @@ impl Renderer {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_t = stop.clone();
-        let swap = cfg.swap;
         let device = SendBox(d3d.device.clone());
         let ctx = SendBox(d3d.context.clone());
         let sc = SendBox(sc);
@@ -267,16 +264,13 @@ impl Renderer {
                 let (top, bot) = caps;
                 let mut stretch: Option<Stretch> = None;
                 let mut first = true;
-                let mut last_swap = swap.load(Ordering::Relaxed);
                 while !stop_t.load(Ordering::Relaxed) {
-                    // Wake on a new frame, or when swap was toggled on a static screen.
+                    // Wake on a new frame (WGC only delivers on change).
                     let woke = unsafe { WaitForSingleObject(frame_event.0, 100) } == WAIT_OBJECT_0;
-                    let swap_now = swap.load(Ordering::Relaxed);
-                    if !first && !woke && swap_now == last_swap {
+                    if !first && !woke {
                         continue;
                     }
                     first = false;
-                    last_swap = swap_now;
                     if unsafe { WaitForSingleObject(waitable, 1000) } != WAIT_OBJECT_0 {
                         continue;
                     }
@@ -287,7 +281,7 @@ impl Renderer {
                             break;
                         }
                     };
-                    let (a, b) = if swap_now { (bot, top) } else { (top, bot) };
+                    let (a, b) = (top, bot);
                     let half = ph / 2;
                     let regions = [(a.latest(), 0, half), (b.latest(), half, ph - half)];
                     for (tex, y, h) in regions {

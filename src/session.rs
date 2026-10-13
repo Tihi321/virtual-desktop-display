@@ -12,13 +12,12 @@
 use crate::capture::{init_winrt, FrameEvent, MonitorCapture};
 use crate::config::Config;
 use crate::cursor_portal::CursorPortal;
-use crate::displays::{self, SavedLayout, TargetInfo, TargetKey};
+use crate::displays::{self, Rect, SavedLayout, TargetInfo, TargetKey};
 use crate::renderer::{create_device, D3d, RenderConfig, Renderer};
 use crate::vdd::parsec::{ParsecVdd, VDD_DISPLAY_NAME};
 use crate::vdd::VirtualDisplays;
 use crate::window_rescue::WindowRescue;
 use anyhow::{anyhow, Context, Result};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -87,18 +86,24 @@ pub struct Session {
     captures: Vec<Arc<MonitorCapture>>,
     saved_layout: Option<SavedLayout>,
     vdd: Option<ParsecVdd>,
-    pub swap: Arc<AtomicBool>,
+    cfg: Config,
+    /// When true the second virtual target (by target id) is placed upper.
+    swap: bool,
+    /// Primary rect and the physical rect BEFORE the session (layout inputs).
+    primary_rect: Rect,
+    orig_physical_rect: Rect,
+    /// The two virtual targets, ordered by target id.
+    virt: [TargetKey; 2],
+    /// Virtual display currently placed upper / lower in the Windows layout,
+    /// and the physical display (fresh after every pipeline start).
     pub v_top: TargetInfo,
     pub v_bot: TargetInfo,
     pub physical: TargetInfo,
-    /// Virtual targets that were activated (to wait for their removal).
-    virtual_keys: Vec<TargetKey>,
 }
 
 impl Session {
-    /// `swap` is shared with the renderer and cursor portal and may be
-    /// toggled at any time.
-    pub fn start(cfg: &Config, swap: Arc<AtomicBool>) -> Result<Self> {
+    /// Start the split; `cfg.swap` decides which virtual target is placed upper.
+    pub fn start(cfg: &Config) -> Result<Self> {
         init_winrt();
         let snap = displays::snapshot().context("enumerate displays")?;
         let before = snap.active.clone();
@@ -143,11 +148,14 @@ impl Session {
             captures: Vec::new(),
             saved_layout: Some(saved),
             vdd: None,
-            swap: swap.clone(),
+            cfg: cfg.clone(),
+            swap: cfg.swap,
+            primary_rect: primary.rect,
+            orig_physical_rect: physical.rect,
+            virt: [physical.key, physical.key],
             v_top: physical.clone(),
             v_bot: physical.clone(),
             physical: physical.clone(),
-            virtual_keys: Vec::new(),
         };
         let added = vdd.add(2);
         s.vdd = Some(vdd);
@@ -155,7 +163,7 @@ impl Session {
 
         tracing::info!("step 2: waiting for new targets and activating them");
         let new = displays::bring_up_new_targets(&snap, 2, Duration::from_secs(8))?;
-        s.virtual_keys = new.iter().map(|t| t.key).collect();
+        s.virt = [new[0].key, new[1].key];
         for t in &new {
             tracing::info!(
                 "new target: {} {} {}",
@@ -164,7 +172,6 @@ impl Session {
                 t.device_path
             );
         }
-        let (top, bot) = (new[0].clone(), new[1].clone());
 
         tracing::info!(
             "step 3: setting modes {}x{}@{}",
@@ -172,7 +179,7 @@ impl Session {
             cfg.height,
             cfg.refresh_hz
         );
-        for t in [&top, &bot] {
+        for t in &new {
             displays::set_mode(
                 &t.gdi_name,
                 cfg.width,
@@ -182,17 +189,37 @@ impl Session {
             )?;
         }
 
-        tracing::info!("step 4: applying layout");
-        let layout = displays::compute_layout(primary.rect, physical.rect, cfg.height as i32);
-        tracing::info!("layout: {layout:?}");
-        displays::apply_layout(&layout, top.key, bot.key, physical.key)?;
+        s.run_pipeline(physical.key)?;
+        tracing::info!("session running");
+        Ok(s)
+    }
 
-        tracing::info!("step 5/6: waiting for the topology to settle, then capture");
+    /// Layout + settle + capture + renderer + portal + rescue, for the current
+    /// `self.swap`. Everything is by POSITION: the display placed upper is
+    /// captured into the upper half and is what the portal maps the upper half to.
+    fn run_pipeline(&mut self, physical_key: TargetKey) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let (upper, lower) = if self.swap {
+            (self.virt[1], self.virt[0])
+        } else {
+            (self.virt[0], self.virt[1])
+        };
+
+        tracing::info!("applying layout (swap={})", self.swap);
+        let layout = displays::compute_layout(
+            self.primary_rect,
+            self.orig_physical_rect,
+            cfg.height as i32,
+        );
+        tracing::info!("layout: {layout:?}");
+        displays::apply_layout(&layout, upper, lower, physical_key)?;
+
+        tracing::info!("waiting for the topology to settle, then capture");
         let d3d = create_device()?;
         let event = FrameEvent::new()?;
         let deadline = Instant::now() + Duration::from_secs(5);
         let settled = loop {
-            match try_capture(cfg, &layout, [top.key, bot.key, physical.key], &d3d, &event) {
+            match try_capture(&cfg, &layout, [upper, lower, physical_key], &d3d, &event) {
                 Ok(v) => break v,
                 Err(e) if Instant::now() < deadline => {
                     tracing::info!("not ready, retrying: {e:#}");
@@ -201,57 +228,49 @@ impl Session {
                 Err(e) => return Err(e),
             }
         };
-        s.v_top = settled.v_top;
-        s.v_bot = settled.v_bot;
-        s.physical = settled.physical;
+        self.v_top = settled.v_top;
+        self.v_bot = settled.v_bot;
+        self.physical = settled.physical;
         tracing::info!(
             "v_top {:?}, v_bot {:?}, physical {:?}",
-            s.v_top.rect,
-            s.v_bot.rect,
-            s.physical.rect
+            self.v_top.rect,
+            self.v_bot.rect,
+            self.physical.rect
         );
         let (cap_top, cap_bot) = (settled.cap_top, settled.cap_bot);
-        s.captures.push(cap_top.clone());
-        s.captures.push(cap_bot.clone());
-        tracing::info!("step 6: renderer");
+        self.captures.push(cap_top.clone());
+        self.captures.push(cap_bot.clone());
+
+        tracing::info!("starting renderer");
         let renderer = Renderer::start(
             &d3d,
             RenderConfig {
-                physical: s.physical.rect,
-                swap: swap.clone(),
+                physical: self.physical.rect,
             },
             cap_top,
             cap_bot,
             event,
         )?;
         let own_hwnd = renderer.hwnd();
-        s.renderer = Some(renderer);
+        self.renderer = Some(renderer);
 
-        tracing::info!("step 7: cursor portal + window rescue");
-        s.portal = Some(CursorPortal::start(
-            s.physical.rect,
-            s.v_top.rect,
-            s.v_bot.rect,
-            swap,
+        tracing::info!("starting cursor portal + window rescue");
+        self.portal = Some(CursorPortal::start(
+            self.physical.rect,
+            self.v_top.rect,
+            self.v_bot.rect,
         )?);
-        s.rescue = Some(WindowRescue::start(
-            s.physical.hmonitor,
-            s.physical.rect,
-            s.v_top.rect,
+        self.rescue = Some(WindowRescue::start(
+            self.physical.hmonitor,
+            self.physical.rect,
+            self.v_top.rect,
             own_hwnd,
         )?);
-        tracing::info!("session running");
-        Ok(s)
+        Ok(())
     }
 
-    /// True while the physical display and both virtual targets are still active.
-    pub fn is_healthy(&self) -> bool {
-        let keys = [self.physical.key, self.v_top.key, self.v_bot.key];
-        displays::all_present(&keys).unwrap_or(false)
-    }
-
-    /// Stop everything in reverse order and restore the original layout.
-    pub fn stop(&mut self) {
+    /// Stop rescue, portal, renderer and captures (the vdd and its keep-alive keep running).
+    fn stop_pipeline(&mut self) {
         if let Some(mut r) = self.rescue.take() {
             tracing::info!("stopping window rescue");
             r.stop();
@@ -268,15 +287,42 @@ impl Session {
             tracing::info!("stopping captures");
             self.captures.clear();
         }
+    }
+
+    /// Exchange which virtual display is placed upper in the Windows layout.
+    /// On failure the whole session is stopped cleanly (virtual displays
+    /// removed, layout restored) and the error returned.
+    pub fn set_swap(&mut self, swap: bool) -> Result<()> {
+        if swap == self.swap {
+            return Ok(());
+        }
+        tracing::info!("swap -> {swap}: rebuilding the pipeline");
+        self.stop_pipeline();
+        self.swap = swap;
+        let pk = self.physical.key;
+        if let Err(e) = self.run_pipeline(pk) {
+            self.stop();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// True while the physical display and both virtual targets are still active.
+    pub fn is_healthy(&self) -> bool {
+        let keys = [self.physical.key, self.virt[0], self.virt[1]];
+        displays::all_present(&keys).unwrap_or(false)
+    }
+
+    /// Stop everything in reverse order and restore the original layout.
+    pub fn stop(&mut self) {
+        self.stop_pipeline();
         // Remove the virtual displays BEFORE restoring the layout.
         if let Some(mut v) = self.vdd.take() {
             tracing::info!("removing virtual displays");
             v.remove_all();
             drop(v);
-            if !self.virtual_keys.is_empty() {
-                let gone = displays::wait_targets_gone(&self.virtual_keys, Duration::from_secs(5));
-                tracing::info!("virtual targets gone: {gone}");
-            }
+            let gone = displays::wait_targets_gone(&self.virt, Duration::from_secs(5));
+            tracing::info!("virtual targets gone: {gone}");
         }
         if let Some(l) = self.saved_layout.take() {
             tracing::info!("restoring original layout");

@@ -7,8 +7,6 @@ use crate::session::Session;
 use anyhow::{anyhow, Result};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -47,7 +45,6 @@ struct App {
     hwnd: Cell<HWND>,
     cfg: RefCell<Config>,
     session: RefCell<Option<Session>>,
-    swap: Arc<AtomicBool>,
     /// A start/stop is in progress (window messages may re-enter).
     busy: Cell<bool>,
     /// The session was running when the machine went to sleep.
@@ -137,7 +134,7 @@ fn start_session(app: &App) {
     }
     app.busy.set(true);
     let cfg = app.cfg.borrow().clone();
-    let r = Session::start(&cfg, app.swap.clone());
+    let r = Session::start(&cfg);
     app.busy.set(false);
     match r {
         Ok(s) => {
@@ -179,7 +176,7 @@ fn show_menu(app: &App) {
         let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE, PCWSTR(toggle.as_ptr()));
         let _ = AppendMenuW(
             menu,
-            MF_STRING | check(app.swap.load(Ordering::Relaxed)),
+            MF_STRING | check(app.cfg.borrow().swap),
             ID_SWAP,
             PCWSTR(swap.as_ptr()),
         );
@@ -238,7 +235,6 @@ fn open_config(app: &App) {
 fn reload_config(app: &App) {
     let new = Config::load();
     tracing::info!("config reloaded: {new:?}");
-    app.swap.store(new.swap, Ordering::Relaxed);
     if let Err(e) = autostart::set_enabled(new.autostart) {
         tracing::warn!("autostart sync failed: {e:#}");
     }
@@ -250,12 +246,37 @@ fn reload_config(app: &App) {
 }
 
 fn toggle_swap(app: &App) {
-    let new = !app.swap.load(Ordering::Relaxed);
-    app.swap.store(new, Ordering::Relaxed);
-    let mut cfg = app.cfg.borrow_mut();
-    cfg.swap = new;
-    if let Err(e) = cfg.save() {
-        tracing::warn!("could not save config: {e:#}");
+    let new = !app.cfg.borrow().swap;
+    {
+        let mut cfg = app.cfg.borrow_mut();
+        cfg.swap = new;
+        if let Err(e) = cfg.save() {
+            tracing::warn!("could not save config: {e:#}");
+        }
+    }
+    if app.busy.get() {
+        return;
+    }
+    // Take the session out while it is busy so re-entrant messages see no session.
+    let taken = app.session.borrow_mut().take();
+    let Some(mut s) = taken else { return };
+    app.busy.set(true);
+    let r = s.set_swap(new);
+    app.busy.set(false);
+    match r {
+        Ok(()) => *app.session.borrow_mut() = Some(s),
+        Err(e) => {
+            // set_swap already stopped the whole session cleanly.
+            tracing::error!("swap failed: {e:#}");
+            drop(s);
+            update_tip(app);
+            balloon(
+                app,
+                "Swap failed",
+                &format!("{e:#}; the split was stopped."),
+                true,
+            );
+        }
     }
 }
 
@@ -404,14 +425,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 /// Run the tray application until Exit.
 pub fn run(cfg: Config) -> Result<()> {
     init_winrt();
-    let swap = Arc::new(AtomicBool::new(cfg.swap));
     let start_on_launch = cfg.start_on_launch;
     let autostart_wanted = cfg.autostart;
     let app = Rc::new(App {
         hwnd: Cell::new(HWND::default()),
         cfg: RefCell::new(cfg),
         session: RefCell::new(None),
-        swap,
         busy: Cell::new(false),
         resume_restart: Cell::new(false),
         taskbar_created: Cell::new(0),

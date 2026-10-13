@@ -3,7 +3,6 @@
 //! `--seconds N` (implies `--cli`): stop automatically after N seconds.
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -93,8 +92,7 @@ fn main() -> Result<()> {
 
     unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), true)? };
     let deadline = seconds.map(|n| std::time::Instant::now() + Duration::from_secs(n));
-    let swap = Arc::new(AtomicBool::new(cfg.swap));
-    let mut session = Session::start(&cfg, swap)?;
+    let mut session = Session::start(&cfg)?;
     tracing::info!("running; press Ctrl+C to stop");
     while !STOP.load(Ordering::SeqCst) && deadline.is_none_or(|d| std::time::Instant::now() < d) {
         std::thread::sleep(Duration::from_millis(100));
