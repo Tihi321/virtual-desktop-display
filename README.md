@@ -61,3 +61,8 @@ While running, the virtual monitors take the physical FlipGo's former place (sta
 - Window rescue moves new, dragged or focused windows on the physical monitor to the top virtual monitor (keeping their relative position, clamped to fit); tool windows and the taskbar are left alone.
 - The physical monitor stays part of the desktop (Windows cannot detach it on Pro editions); it is just covered by the renderer window.
 - Manual rearrangement of displays in Settings while the split runs is not tracked.
+
+## Known quirks
+
+- The cursor treats the hidden physical display as a wall when moving into it from another monitor (it stops at the edge; sliding along the edge still works). The cursor is only warped onto the virtual monitors if it is already inside the physical rect (for example after Win+Shift+arrow or at startup).
+- Windows Settings > Display > Identify draws the hidden physical display's number (for example "2") over the bottom-left corner of the bottom panel, because system overlays sit above our window. It covers the virtual display's number but is harmless.

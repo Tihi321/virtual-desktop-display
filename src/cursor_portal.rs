@@ -4,7 +4,7 @@
 //! V-top (upper half) or V-bot (lower half).
 use crate::displays::Rect;
 use anyhow::{anyhow, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread::JoinHandle;
 use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
@@ -45,21 +45,93 @@ pub fn map_point(physical: Rect, top: Rect, bot: Rect, pt: (i32, i32)) -> Option
     ))
 }
 
+/// What the hook should do with a mouse move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Allow,
+    MoveTo(i32, i32),
+}
+
+fn inside(r: Rect, p: (i32, i32)) -> bool {
+    p.0 >= r.x && p.0 < r.right() && p.1 >= r.y && p.1 < r.bottom()
+}
+
+/// Decide what to do with a move from `prev` to `new`.
+///
+/// * Not entering the physical rect: Allow.
+/// * Entering it from outside: the rect is a WALL; the cursor is put back just
+///   outside on the side it came from, keeping the other coordinate so sliding
+///   along the edge works.
+/// * Already inside (warped there by an app or startup): map onto V-top/V-bot.
+///
+/// `top`/`bot` are the virtual displays; they are exchanged when `swap` is set.
+pub fn resolve_move(
+    physical: Rect,
+    top: Rect,
+    bot: Rect,
+    swap: bool,
+    prev: (i32, i32),
+    new: (i32, i32),
+) -> Action {
+    if !inside(physical, new) {
+        return Action::Allow;
+    }
+    if inside(physical, prev) {
+        let (t, b) = if swap { (bot, top) } else { (top, bot) };
+        return match map_point(physical, t, b, new) {
+            Some((x, y)) => Action::MoveTo(x, y),
+            None => Action::Allow,
+        };
+    }
+    if prev.1 < physical.y {
+        Action::MoveTo(new.0, physical.y - 1)
+    } else if prev.1 >= physical.bottom() {
+        Action::MoveTo(new.0, physical.bottom())
+    } else if prev.0 < physical.x {
+        Action::MoveTo(physical.x - 1, new.1)
+    } else {
+        Action::MoveTo(physical.right(), new.1)
+    }
+}
+
 struct State {
     physical: Rect,
     v_top: Rect,
     v_bot: Rect,
     swap: Arc<AtomicBool>,
+    /// Last known cursor position (only touched from the hook thread).
+    prev_x: AtomicI32,
+    prev_y: AtomicI32,
+    has_prev: AtomicBool,
 }
 
 impl State {
-    fn map(&self, pt: (i32, i32)) -> Option<(i32, i32)> {
-        let (t, b) = if self.swap.load(Ordering::Relaxed) {
-            (self.v_bot, self.v_top)
-        } else {
-            (self.v_top, self.v_bot)
-        };
-        map_point(self.physical, t, b, pt)
+    fn resolve(&self, prev: (i32, i32), new: (i32, i32)) -> Action {
+        resolve_move(
+            self.physical,
+            self.v_top,
+            self.v_bot,
+            self.swap.load(Ordering::Relaxed),
+            prev,
+            new,
+        )
+    }
+
+    fn prev(&self) -> Option<(i32, i32)> {
+        if self.has_prev.load(Ordering::Relaxed) {
+            return Some((
+                self.prev_x.load(Ordering::Relaxed),
+                self.prev_y.load(Ordering::Relaxed),
+            ));
+        }
+        let mut p = POINT::default();
+        unsafe { GetCursorPos(&mut p) }.ok().map(|_| (p.x, p.y))
+    }
+
+    fn set_prev(&self, p: (i32, i32)) {
+        self.prev_x.store(p.0, Ordering::Relaxed);
+        self.prev_y.store(p.1, Ordering::Relaxed);
+        self.has_prev.store(true, Ordering::Relaxed);
     }
 }
 
@@ -70,9 +142,15 @@ unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
         let info = &*(lp.0 as *const MSLLHOOKSTRUCT);
         if let Ok(g) = STATE.try_read() {
             if let Some(s) = g.as_ref() {
-                if let Some((x, y)) = s.map((info.pt.x, info.pt.y)) {
-                    let _ = SetCursorPos(x, y);
-                    return LRESULT(1);
+                let new = (info.pt.x, info.pt.y);
+                let prev = s.prev().unwrap_or(new);
+                match s.resolve(prev, new) {
+                    Action::MoveTo(x, y) => {
+                        let _ = SetCursorPos(x, y);
+                        s.set_prev((x, y));
+                        return LRESULT(1);
+                    }
+                    Action::Allow => s.set_prev(new),
                 }
             }
         }
@@ -92,13 +170,17 @@ impl CursorPortal {
             v_top,
             v_bot,
             swap,
+            prev_x: AtomicI32::new(0),
+            prev_y: AtomicI32::new(0),
+            has_prev: AtomicBool::new(false),
         });
         *STATE.write().unwrap() = Some(state.clone());
 
         // If the cursor is already on the physical display, move it off now.
         let mut p = POINT::default();
         if unsafe { GetCursorPos(&mut p) }.is_ok() {
-            if let Some((x, y)) = state.map((p.x, p.y)) {
+            // prev == new: if it is inside the physical rect it gets mapped off.
+            if let Action::MoveTo(x, y) = state.resolve((p.x, p.y), (p.x, p.y)) {
                 unsafe {
                     let _ = SetCursorPos(x, y);
                 }
@@ -211,16 +293,47 @@ mod tests {
     }
 
     #[test]
-    fn swap_exchanges_halves() {
-        let st = State {
-            physical: PHYS,
-            v_top: TOP,
-            v_bot: BOT,
-            swap: Arc::new(AtomicBool::new(true)),
-        };
-        assert_eq!(st.map((1520, 1440)), Some((-1920, 1080)));
-        assert_eq!(st.map((1520, 2520)), Some((-1920, 0)));
-        st.swap.store(false, Ordering::Relaxed);
-        assert_eq!(st.map((1520, 1440)), Some((-1920, 0)));
+    fn outside_to_outside_is_allowed() {
+        let r = |prev, new| resolve_move(PHYS, TOP, BOT, false, prev, new);
+        assert_eq!(r((100, 100), (110, 120)), Action::Allow);
+        assert_eq!(r((1519, 1439), (1519, 1439)), Action::Allow);
+    }
+
+    #[test]
+    fn enter_from_top_is_a_wall() {
+        let r = |prev, new| resolve_move(PHYS, TOP, BOT, false, prev, new);
+        // moving down off the Asus at x=2000: stay on the Asus's last row
+        assert_eq!(r((2000, 1439), (2000, 1441)), Action::MoveTo(2000, 1439));
+        // diagonal: keep the new x so sliding along the edge works
+        assert_eq!(r((1500, 1430), (1530, 1450)), Action::MoveTo(1530, 1439));
+    }
+
+    #[test]
+    fn enter_from_other_sides() {
+        let r = |prev, new| resolve_move(PHYS, TOP, BOT, false, prev, new);
+        assert_eq!(r((1500, 2000), (1530, 2010)), Action::MoveTo(1519, 2010)); // from left
+        assert_eq!(r((3450, 2000), (3430, 2005)), Action::MoveTo(3440, 2005)); // from right
+        assert_eq!(r((2000, 3605), (2000, 3590)), Action::MoveTo(2000, 3600)); // from below
+    }
+
+    #[test]
+    fn already_inside_is_mapped() {
+        let r = |swap, prev, new| resolve_move(PHYS, TOP, BOT, swap, prev, new);
+        assert_eq!(
+            r(false, (2000, 2000), (1520, 1440)),
+            Action::MoveTo(-1920, 0)
+        );
+        assert_eq!(
+            r(false, (2000, 2000), (1520, 2520)),
+            Action::MoveTo(-1920, 1080)
+        );
+        assert_eq!(
+            r(true, (2000, 2000), (1520, 1440)),
+            Action::MoveTo(-1920, 1080)
+        );
+        assert_eq!(
+            r(true, (2000, 2000), (1520, 2520)),
+            Action::MoveTo(-1920, 0)
+        );
     }
 }
