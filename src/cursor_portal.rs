@@ -306,6 +306,15 @@ mod tests {
     }
 
     #[test]
+    fn enter_from_below_when_physical_is_above() {
+        let above = Rect::new(1520, -2160, 1920, 2160);
+        let r = |prev, new| resolve_move(above, TOP, BOT, prev, new);
+        // moving up off the primary's top edge: stay on the primary's first row
+        assert_eq!(r((2000, 0), (2000, -2)), Action::MoveTo(2000, 0));
+        assert_eq!(r((1500, 5), (1530, -3)), Action::MoveTo(1530, 0));
+    }
+
+    #[test]
     fn already_inside_is_mapped() {
         let r = |prev, new| resolve_move(PHYS, TOP, BOT, prev, new);
         assert_eq!(r((2000, 2000), (1520, 1440)), Action::MoveTo(-1920, 0));

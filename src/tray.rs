@@ -469,8 +469,11 @@ pub fn run(cfg: Config) -> Result<()> {
         )?;
         app.hwnd.set(hwnd);
         add_tray_icon(&app);
-        if let Err(e) = autostart::set_enabled(autostart_wanted) {
-            tracing::warn!("autostart sync failed: {e:#}");
+        // Only ensure the entry exists; never delete it implicitly at startup.
+        if autostart_wanted {
+            if let Err(e) = autostart::set_enabled(true) {
+                tracing::warn!("autostart sync failed: {e:#}");
+            }
         }
         if start_on_launch {
             let _ = PostMessageW(Some(hwnd), WM_START_INITIAL, WPARAM(0), LPARAM(0));

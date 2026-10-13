@@ -492,21 +492,26 @@ pub struct Layout {
 ///
 /// * V-top goes exactly where the physical display currently is (same x, top y).
 /// * V-bot goes directly below V-top (same x).
-/// * The physical display is moved to touch only the bottom edge of the primary,
-///   right-aligned with it.
+/// * The physical display is moved ABOVE the primary, touching only the
+///   primary's top edge, right-aligned. Above (not below) so that the hardware
+///   cursor sprite, which extends down/right from the hotspot, never crosses
+///   into it when the cursor is stopped at the primary's edge. If the primary
+///   is narrower than the physical display it is left-aligned instead.
 pub fn compute_layout(primary: Rect, physical: Rect, v_top_h: i32) -> Layout {
+    let x = (primary.right() - physical.w).max(primary.x);
     Layout {
         v_top: (physical.x, physical.y),
         v_bot: (physical.x, physical.y + v_top_h),
-        physical: (primary.right() - physical.w, primary.bottom()),
+        physical: (x, primary.y - physical.h),
     }
 }
 
-/// True if `physical` sits exactly where our layout would have put it
-/// (touching the primary's bottom edge, right-aligned) - used to warn about a
-/// layout left behind by a killed session.
+/// True if `physical` sits where our layout would have put it (directly above
+/// the primary, right- or left-aligned) - used to warn about a layout left
+/// behind by a killed session.
 pub fn looks_like_our_layout(primary: Rect, physical: Rect) -> bool {
-    physical.y == primary.bottom() && physical.right() == primary.right()
+    physical.bottom() == primary.y
+        && (physical.right() == primary.right() || physical.x == primary.x)
 }
 
 /// True if every key is currently an active target.
@@ -591,7 +596,7 @@ mod tests {
         let l = compute_layout(primary, physical, 1080);
         assert_eq!(l.v_top, (-1920, -91));
         assert_eq!(l.v_bot, (-1920, 989));
-        assert_eq!(l.physical, (1520, 1440));
+        assert_eq!(l.physical, (1520, -2160));
 
         let vt = Rect::new(l.v_top.0, l.v_top.1, 1920, 1080);
         let vb = Rect::new(l.v_bot.0, l.v_bot.1, 1920, 1080);
@@ -608,9 +613,27 @@ mod tests {
         }
         // V-top and V-bot are adjacent without gap.
         assert_eq!(vt.bottom(), vb.y);
-        // Physical touches only the primary's bottom edge, right-aligned.
-        assert_eq!(ph.y, primary.bottom());
+        // Physical touches only the primary's top edge, right-aligned.
+        assert_eq!(ph.bottom(), primary.y);
         assert_eq!(ph.right(), primary.right());
+        // ...and does not touch the virtual displays (no shared edge either).
+        for v in [vt, vb] {
+            assert!(
+                ph.right() <= v.x || v.right() <= ph.x || ph.bottom() <= v.y || v.bottom() <= ph.y
+            );
+            assert!(ph.x > v.right() || ph.right() < v.x);
+        }
+    }
+
+    #[test]
+    fn narrow_primary_falls_back_to_left_aligned() {
+        let primary = Rect::new(0, 0, 1000, 1440);
+        let physical = Rect::new(-1920, 0, 1920, 2160);
+        let l = compute_layout(primary, physical, 1080);
+        assert_eq!(l.physical, (0, -2160));
+        let ph = Rect::new(l.physical.0, l.physical.1, 1920, 2160);
+        let vt = Rect::new(l.v_top.0, l.v_top.1, 1920, 1080);
+        assert!(!ph.intersects(&vt) && !ph.intersects(&primary));
     }
 
     #[test]
@@ -618,7 +641,7 @@ mod tests {
         let primary = Rect::new(0, 0, 3440, 1440);
         assert!(looks_like_our_layout(
             primary,
-            Rect::new(1520, 1440, 1920, 2160)
+            Rect::new(1520, -2160, 1920, 2160)
         ));
         assert!(!looks_like_our_layout(
             primary,

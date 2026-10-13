@@ -10,7 +10,7 @@ use vdd_app::{config::Config, session::Session, set_dpi_aware, tray};
 use windows::core::{w, BOOL};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::System::Console::{
-    AttachConsole, SetConsoleCtrlHandler, ATTACH_PARENT_PROCESS,
+    AttachConsole, GetConsoleWindow, SetConsoleCtrlHandler, ATTACH_PARENT_PROCESS,
 };
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
@@ -27,7 +27,9 @@ unsafe extern "system" fn ctrl_handler(_ctrl: u32) -> BOOL {
 fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    let stderr = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    // Only log to stderr when a console is attached (GUI subsystem has none).
+    let has_console = !unsafe { GetConsoleWindow() }.0.is_null();
+    let stderr = has_console.then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     let (file_layer, guard) = match Config::dir() {
         Some(d) => {
             let appender = tracing_appender::rolling::daily(d.join("logs"), "vdd.log");
@@ -87,6 +89,7 @@ fn main() -> Result<()> {
     tracing::info!("config: {cfg:?}");
 
     if !cli {
+        tracing::info!("tray mode started, version {}", env!("CARGO_PKG_VERSION"));
         return tray::run(cfg);
     }
 

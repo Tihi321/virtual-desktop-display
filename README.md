@@ -50,7 +50,7 @@ If the physical size is not `width` x `2*height`, each half is stretched with a 
 
 ## Layout
 
-While running, the virtual monitors take the physical FlipGo's former place (stacked) and the physical FlipGo is moved to touch only the bottom edge of the primary monitor, right-aligned. The layout is applied without `SDC_SAVE_TO_DATABASE`, so if the process is killed the virtual monitors vanish within about a second and Windows falls back to its stored layout. On a normal stop the virtual monitors are removed first and the original layout is then re-applied.
+While running, the virtual monitors take the physical FlipGo's former place (stacked) and the physical FlipGo is moved above the primary monitor, touching only its top edge, right-aligned (above rather than below so the cursor sprite never bleeds onto it). The layout is applied without `SDC_SAVE_TO_DATABASE`, so if the process is killed the virtual monitors vanish within about a second and Windows falls back to its stored layout. On a normal stop the virtual monitors are removed first and the original layout is then re-applied.
 
 ## Known limitations
 
