@@ -1,8 +1,8 @@
 [package]
 name = "virtual-desktop-display"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Split a FlipGo stacked monitor into two virtual 1920x1080 displays"
+description = "Split any monitor into multiple real virtual monitors on Windows (columns, rows, grid, custom) using a virtual display driver"
 
 [lib]
 name = "vdd_app"
@@ -19,6 +19,8 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
+serde_json = "1.0.154"
 
 [dependencies.windows]
 version = "0.62"
@@ -37,7 +39,12 @@ features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
     "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Console",
@@ -50,6 +57,7 @@ features = [
     "Win32_System_WinRT_Graphics_Capture",
     "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]

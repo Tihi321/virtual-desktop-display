@@ -1,12 +1,21 @@
-//! Split a FlipGo stacked monitor into two virtual 1920x1080 displays.
+//! Split any display into several virtual displays (columns, rows, grid or custom).
+pub mod autosplit;
 pub mod autostart;
 pub mod capture;
 pub mod config;
 pub mod cursor_portal;
 pub mod displays;
+pub mod driver;
+pub mod geometry;
+pub mod hotkeys;
+pub mod ipc;
+pub mod layout;
+pub mod modes;
 pub mod renderer;
 pub mod session;
+pub mod session_worker;
 pub mod tray;
+pub mod ui;
 pub mod vdd;
 pub mod window_rescue;
 

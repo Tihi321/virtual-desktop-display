@@ -1,6 +1,7 @@
 //! Window rescue: any normal top-level window that shows up on (or is dragged
-//! onto) the physical display, which is hidden behind our renderer, is moved
-//! to V-top, keeping its relative offset and clamping its size to fit.
+//! onto) a physical display hidden behind our renderer is moved to the virtual
+//! display of the piece under the window centre (piece 0 as a fallback),
+//! keeping its offset inside the piece and clamping its size to fit.
 use crate::displays::Rect;
 use anyhow::{anyhow, Result};
 use std::sync::mpsc;
@@ -21,12 +22,42 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
+/// One hidden physical display and the virtual displays standing in for it.
+#[derive(Debug, Clone)]
+pub struct RescueSplit {
+    pub physical_hmon: isize,
+    /// Desktop rect of the hidden physical display.
+    pub physical: Rect,
+    /// Per piece: (source rect relative to `physical`, desktop rect of the
+    /// virtual display showing it).
+    pub pieces: Vec<(Rect, Rect)>,
+}
+
 struct State {
-    physical_hmon: isize,
-    physical: Rect,
-    v_top: Rect,
-    /// Renderer window (also skipped by SKIPOWNPROCESS, but be explicit).
-    own_hwnd: isize,
+    splits: Vec<RescueSplit>,
+    /// Renderer windows (also skipped by SKIPOWNPROCESS, but be explicit).
+    own_hwnds: Vec<isize>,
+}
+
+/// The piece under the window centre (relative to `physical`), else piece 0.
+/// Returns (source rect in desktop coordinates, virtual target rect).
+pub fn pick_piece(split: &RescueSplit, win: Rect) -> Option<(Rect, Rect)> {
+    let cx = win.x + win.w / 2 - split.physical.x;
+    let cy = win.y + win.h / 2 - split.physical.y;
+    let (src, virt) = split
+        .pieces
+        .iter()
+        .find(|(s, _)| cx >= s.x && cx < s.right() && cy >= s.y && cy < s.bottom())
+        .or(split.pieces.first())?;
+    Some((
+        Rect::new(
+            split.physical.x + src.x,
+            split.physical.y + src.y,
+            src.w,
+            src.h,
+        ),
+        *virt,
+    ))
 }
 
 static STATE: RwLock<Option<Arc<State>>> = RwLock::new(None);
@@ -59,7 +90,7 @@ fn is_ignored_class(hwnd: HWND) -> bool {
 fn maybe_rescue(st: &State, hwnd: HWND) {
     unsafe {
         if hwnd.0.is_null()
-            || hwnd.0 as isize == st.own_hwnd
+            || st.own_hwnds.contains(&(hwnd.0 as isize))
             || !IsWindowVisible(hwnd).as_bool()
             || IsIconic(hwnd).as_bool()
             || GetAncestor(hwnd, GA_ROOT) != hwnd
@@ -87,9 +118,9 @@ fn maybe_rescue(st: &State, hwnd: HWND) {
             return;
         }
         let mon: HMONITOR = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
-        if mon.0 as isize != st.physical_hmon {
+        let Some(split) = st.splits.iter().find(|s| s.physical_hmon == mon.0 as isize) else {
             return;
-        }
+        };
 
         let maximized = IsZoomed(hwnd).as_bool();
         if maximized {
@@ -100,7 +131,10 @@ fn maybe_rescue(st: &State, hwnd: HWND) {
             return;
         }
         let win = Rect::new(r.left, r.top, r.right - r.left, r.bottom - r.top);
-        let n = rescue_rect(st.physical, st.v_top, win);
+        let Some((src, target)) = pick_piece(split, win) else {
+            return;
+        };
+        let n = rescue_rect(src, target, win);
         tracing::info!("window rescue: {hwnd:?} {win:?} -> {n:?} (maximized={maximized})");
         let _ = SetWindowPos(
             hwnd,
@@ -152,18 +186,8 @@ pub struct WindowRescue {
 }
 
 impl WindowRescue {
-    pub fn start(
-        physical_hmon: isize,
-        physical: Rect,
-        v_top: Rect,
-        own_hwnd: isize,
-    ) -> Result<Self> {
-        *STATE.write().unwrap() = Some(Arc::new(State {
-            physical_hmon,
-            physical,
-            v_top,
-            own_hwnd,
-        }));
+    pub fn start(splits: Vec<RescueSplit>, own_hwnds: Vec<isize>) -> Result<Self> {
+        *STATE.write().unwrap() = Some(Arc::new(State { splits, own_hwnds }));
         let (tx, rx) = mpsc::channel::<Result<u32, String>>();
         let thread = std::thread::Builder::new()
             .name("window-rescue".into())
@@ -186,7 +210,7 @@ impl WindowRescue {
                     hooks.push(h);
                 }
                 let _ = tx.send(Ok(GetCurrentThreadId()));
-                // Initial sweep for windows already on the physical display.
+                // Initial sweep for windows already on a hidden display.
                 let _ = EnumWindows(Some(enum_proc), LPARAM(0));
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
@@ -261,5 +285,61 @@ mod tests {
         // lower-half window: pushed up into V-top
         let r = rescue_rect(PHYS, TOP, Rect::new(2000, 3000, 500, 400));
         assert_eq!(r, Rect::new(-1440, 680, 500, 400));
+    }
+
+    #[test]
+    fn picks_piece_under_window_centre() {
+        let split = RescueSplit {
+            physical_hmon: 1,
+            physical: PHYS,
+            pieces: vec![
+                (Rect::new(0, 0, 1920, 1080), TOP),
+                (
+                    Rect::new(0, 1080, 1920, 1080),
+                    Rect::new(-1920, 1080, 1920, 1080),
+                ),
+            ],
+        };
+        // centre in the upper half
+        let (src, t) = pick_piece(&split, Rect::new(1620, 1540, 800, 600)).unwrap();
+        assert_eq!((src, t), (Rect::new(1520, 1440, 1920, 1080), TOP));
+        // centre in the lower half
+        let (src, t) = pick_piece(&split, Rect::new(2000, 3000, 500, 400)).unwrap();
+        assert_eq!(src, Rect::new(1520, 2520, 1920, 1080));
+        assert_eq!(t, Rect::new(-1920, 1080, 1920, 1080));
+        // lower-half window keeps its offset inside its own piece
+        assert_eq!(
+            rescue_rect(src, t, Rect::new(2000, 3000, 500, 400)),
+            Rect::new(-1440, 1560, 500, 400)
+        );
+        // centre outside every piece: piece 0
+        let (_, t) = pick_piece(&split, Rect::new(0, 0, 10, 10)).unwrap();
+        assert_eq!(t, TOP);
+        // no pieces: nothing to do
+        let empty = RescueSplit {
+            pieces: vec![],
+            ..split
+        };
+        assert!(pick_piece(&empty, Rect::new(0, 0, 1, 1)).is_none());
+    }
+
+    #[test]
+    fn column_pieces() {
+        let hidden = Rect::new(0, -1440, 3440, 1440);
+        let split = RescueSplit {
+            physical_hmon: 1,
+            physical: hidden,
+            pieces: vec![
+                (Rect::new(0, 0, 1720, 1440), Rect::new(0, 0, 1720, 1440)),
+                (
+                    Rect::new(1720, 0, 1720, 1440),
+                    Rect::new(1720, 0, 1720, 1440),
+                ),
+            ],
+        };
+        let win = Rect::new(2000, -1000, 400, 300);
+        let (src, t) = pick_piece(&split, win).unwrap();
+        assert_eq!(t.x, 1720);
+        assert_eq!(rescue_rect(src, t, win), Rect::new(2000, 440, 400, 300));
     }
 }

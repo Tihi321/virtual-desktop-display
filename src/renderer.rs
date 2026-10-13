@@ -1,8 +1,10 @@
 //! D3D11 device, borderless topmost window on the physical monitor, flip-model
-//! swapchain and the compose loop (V-top over the top half, V-bot over the bottom).
+//! swapchain and the compose loop (each virtual display's capture is drawn
+//! over its piece of the physical display).
 use crate::capture::{FrameEvent, MonitorCapture, SendBox};
 use crate::displays::Rect;
 use anyhow::{anyhow, bail, Result};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -15,9 +17,10 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11PixelShader,
-    ID3D11SamplerState, ID3D11Texture2D, ID3D11VertexShader, D3D11_BOX,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_VIEWPORT,
+    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11VertexShader, D3D11_BOX, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -139,10 +142,6 @@ fn spawn_window_thread(rect: Rect) -> Result<(isize, JoinHandle<()>)> {
     }
 }
 
-pub struct RenderConfig {
-    pub physical: Rect,
-}
-
 pub struct Renderer {
     hwnd: isize,
     stop: Arc<AtomicBool>,
@@ -179,15 +178,16 @@ fn copy_region(
 }
 
 impl Renderer {
-    /// Start rendering `top`/`bot` captures onto a window covering `cfg.physical`.
+    /// Start rendering onto a window covering `physical`. Each piece is a
+    /// capture plus its destination rect RELATIVE to the physical display;
+    /// everything not covered by a piece stays black.
     pub fn start(
         d3d: &D3d,
-        cfg: RenderConfig,
-        top: Arc<MonitorCapture>,
-        bot: Arc<MonitorCapture>,
+        physical: Rect,
+        pieces: Vec<(Arc<MonitorCapture>, Rect)>,
         frame_event: Arc<FrameEvent>,
     ) -> Result<Self> {
-        let rect = cfg.physical;
+        let rect = physical;
         let (hwnd_raw, window_thread) = spawn_window_thread(rect)?;
         let hwnd = HWND(hwnd_raw as *mut _);
 
@@ -236,13 +236,6 @@ impl Renderer {
 
         let pw = rect.w as u32;
         let ph = rect.h as u32;
-        if (rect.w, rect.h) != (1920, 2160) {
-            tracing::warn!(
-                "physical size {}x{}: sources that do not match their half are stretched with a shader",
-                rect.w,
-                rect.h
-            );
-        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_t = stop.clone();
@@ -250,19 +243,18 @@ impl Renderer {
         let ctx = SendBox(d3d.context.clone());
         let sc = SendBox(sc);
         let waitable = SendBox(waitable);
-        let caps = SendBox((top, bot));
+        let pieces = SendBox(pieces);
         let render_thread = std::thread::Builder::new()
             .name("render".into())
             .spawn(move || {
-                let (device, ctx, sc, waitable, caps) = (
+                let (device, ctx, sc, waitable, pieces) = (
                     device.get(),
                     ctx.get(),
                     sc.get(),
                     *waitable.get(),
-                    caps.get(),
+                    pieces.get(),
                 );
-                let (top, bot) = caps;
-                let mut stretch: Option<Stretch> = None;
+                let mut gpu = Gpu::default();
                 let mut first = true;
                 while !stop_t.load(Ordering::Relaxed) {
                     // Wake on a new frame (WGC only delivers on change).
@@ -281,33 +273,24 @@ impl Renderer {
                             break;
                         }
                     };
-                    let (a, b) = (top, bot);
-                    let half = ph / 2;
-                    let regions = [(a.latest(), 0, half), (b.latest(), half, ph - half)];
-                    for (tex, y, h) in regions {
-                        let Some(t) = tex else { continue };
+                    match gpu.rtv(device, &buf) {
+                        Ok(rtv) => unsafe {
+                            ctx.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]);
+                        },
+                        Err(e) => tracing::error!("backbuffer RTV: {e}"),
+                    }
+                    for (cap, dest) in pieces.iter() {
+                        let Some(t) = cap.latest() else { continue };
+                        let (dx, dy) = (dest.x.max(0) as u32, dest.y.max(0) as u32);
                         let mut d = D3D11_TEXTURE2D_DESC::default();
                         unsafe { t.GetDesc(&mut d) };
-                        if d.Width == pw && d.Height == h {
-                            copy_region(ctx, &buf, pw, ph, 0, y, &t);
+                        if d.Width == dest.w as u32 && d.Height == dest.h as u32 {
+                            copy_region(ctx, &buf, pw, ph, dx, dy, &t);
                             continue;
                         }
-                        if stretch.is_none() {
-                            match Stretch::new(device) {
-                                Ok(s) => stretch = Some(s),
-                                Err(e) => {
-                                    tracing::error!("stretch shader init failed: {e}");
-                                    copy_region(ctx, &buf, pw, ph, 0, y, &t);
-                                    continue;
-                                }
-                            }
-                        }
-                        if let Some(s) = &stretch {
-                            let r =
-                                s.draw(device, ctx, &buf, &t, (0.0, y as f32, pw as f32, h as f32));
-                            if let Err(e) = r {
-                                tracing::error!("stretch draw failed: {e}");
-                            }
+                        if let Err(e) = gpu.stretch(device, ctx, &buf, &t, *dest) {
+                            tracing::error!("stretch draw failed: {e}");
+                            copy_region(ctx, &buf, pw, ph, dx, dy, &t);
                         }
                     }
                     let hr =
@@ -404,7 +387,7 @@ fn compile_shader(entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
 }
 
 /// Fullscreen-triangle pass with linear sampling, used when a source does not
-/// match its half of the physical display.
+/// match its piece of the physical display.
 struct Stretch {
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
@@ -441,20 +424,15 @@ impl Stretch {
         })
     }
 
-    /// Draw `src` stretched over `vp` = (x, y, w, h) of `target`.
+    /// Draw `srv` stretched over `vp` = (x, y, w, h) of the target `rtv`.
     fn draw(
         &self,
-        device: &ID3D11Device,
         ctx: &ID3D11DeviceContext,
-        target: &ID3D11Texture2D,
-        src: &ID3D11Texture2D,
+        rtv: &ID3D11RenderTargetView,
+        srv: &ID3D11ShaderResourceView,
         vp: (f32, f32, f32, f32),
-    ) -> Result<()> {
-        let mut rtv = None;
-        let mut srv = None;
+    ) {
         unsafe {
-            device.CreateRenderTargetView(target, None, Some(&mut rtv))?;
-            device.CreateShaderResourceView(src, None, Some(&mut srv))?;
             let vp = D3D11_VIEWPORT {
                 TopLeftX: vp.0,
                 TopLeftY: vp.1,
@@ -463,18 +441,92 @@ impl Stretch {
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             };
-            ctx.OMSetRenderTargets(Some(&[rtv]), None);
+            ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
             ctx.RSSetViewports(Some(&[vp]));
             ctx.IASetInputLayout(None);
             ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx.VSSetShader(&self.vs, None);
             ctx.PSSetShader(&self.ps, None);
-            ctx.PSSetShaderResources(0, Some(&[srv]));
+            ctx.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             ctx.Draw(3, 0);
             // Unbind so the next copy / Present has no outstanding bindings.
             ctx.PSSetShaderResources(0, Some(&[None]));
             ctx.OMSetRenderTargets(None, None);
+        }
+    }
+}
+
+/// Per-renderer GPU state: the stretch pass plus views cached per texture
+/// (capture textures are persistent; back buffers rotate through a few).
+#[derive(Default)]
+struct Gpu {
+    stretch: Option<Stretch>,
+    rtvs: HashMap<usize, (ID3D11Texture2D, ID3D11RenderTargetView)>,
+    srvs: HashMap<usize, (ID3D11Texture2D, ID3D11ShaderResourceView)>,
+}
+
+impl Gpu {
+    fn rtv(
+        &mut self,
+        device: &ID3D11Device,
+        tex: &ID3D11Texture2D,
+    ) -> Result<ID3D11RenderTargetView> {
+        let key = tex.as_raw() as usize;
+        if let Some((_, v)) = self.rtvs.get(&key) {
+            return Ok(v.clone());
+        }
+        if self.rtvs.len() > 16 {
+            self.rtvs.clear();
+        }
+        let mut v = None;
+        unsafe { device.CreateRenderTargetView(tex, None, Some(&mut v))? };
+        let v = v.ok_or_else(|| anyhow!("no RTV"))?;
+        // Keep the texture alive so its address cannot be reused by another one.
+        self.rtvs.insert(key, (tex.clone(), v.clone()));
+        Ok(v)
+    }
+
+    fn srv(
+        &mut self,
+        device: &ID3D11Device,
+        tex: &ID3D11Texture2D,
+    ) -> Result<ID3D11ShaderResourceView> {
+        let key = tex.as_raw() as usize;
+        if let Some((_, v)) = self.srvs.get(&key) {
+            return Ok(v.clone());
+        }
+        if self.srvs.len() > 32 {
+            self.srvs.clear();
+        }
+        let mut v = None;
+        unsafe { device.CreateShaderResourceView(tex, None, Some(&mut v))? };
+        let v = v.ok_or_else(|| anyhow!("no SRV"))?;
+        self.srvs.insert(key, (tex.clone(), v.clone()));
+        Ok(v)
+    }
+
+    /// Stretch `src` over `dest` of `target`.
+    fn stretch(
+        &mut self,
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
+        target: &ID3D11Texture2D,
+        src: &ID3D11Texture2D,
+        dest: Rect,
+    ) -> Result<()> {
+        if self.stretch.is_none() {
+            self.stretch = Some(Stretch::new(device)?);
+        }
+        let rtv = self.rtv(device, target)?;
+        let srv = self.srv(device, src)?;
+        if let Some(s) = &self.stretch {
+            s.draw(
+                ctx,
+                &rtv,
+                &srv,
+                (dest.x as f32, dest.y as f32, dest.w as f32, dest.h as f32),
+            );
         }
         Ok(())
     }

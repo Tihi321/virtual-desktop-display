@@ -1,4 +1,6 @@
 //! Display enumeration, mode setting and layout (QueryDisplayConfig / SetDisplayConfig).
+use crate::config::SplitConfig;
+use crate::vdd::parsec::VDD_DISPLAY_NAME;
 use anyhow::{anyhow, bail, Result};
 use std::time::{Duration, Instant};
 use windows::core::BOOL;
@@ -9,7 +11,7 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
     DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
     QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS, QUERY_DISPLAY_CONFIG_FLAGS, SDC_ALLOW_CHANGES, SDC_APPLY,
-    SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows::Win32::Foundation::{LPARAM, LUID, POINTL, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -219,6 +221,66 @@ pub fn find_physical<'a>(targets: &'a [TargetInfo], needle: &str) -> Option<&'a 
         .find(|t| t.friendly_name.to_lowercase().contains(&n))
 }
 
+impl TargetInfo {
+    /// EDID manufacturer + product id from the device path, e.g.
+    /// `\\?\DISPLAY#RTK4707#5&..` gives "RTK4707".
+    pub fn display_id(&self) -> Option<String> {
+        display_id_from_path(&self.device_path)
+    }
+
+    /// True for displays created by the virtual display driver (ours).
+    pub fn is_virtual(&self) -> bool {
+        self.friendly_name.contains(VDD_DISPLAY_NAME)
+            || self
+                .display_id()
+                .is_some_and(|id| id.to_ascii_uppercase().starts_with("PSCCDD"))
+    }
+}
+
+/// Parse "RTK4707" out of `\\?\DISPLAY#RTK4707#...`.
+pub fn display_id_from_path(path: &str) -> Option<String> {
+    let mut it = path.split('#');
+    let head = it.next()?;
+    if !head.to_ascii_uppercase().ends_with("DISPLAY") {
+        return None;
+    }
+    let id = it.next()?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Find the real display a split refers to: `display_id` exactly (case
+/// insensitive) first, then `name_match` as a case-insensitive substring of the
+/// friendly name. Virtual displays are never returned.
+pub fn resolve_split<'a>(targets: &'a [TargetInfo], split: &SplitConfig) -> Option<&'a TargetInfo> {
+    let real = || targets.iter().filter(|t| !t.is_virtual());
+    let id = split.display_id.trim();
+    if !id.is_empty() {
+        if let Some(t) = real().find(|t| t.display_id().is_some_and(|d| d.eq_ignore_ascii_case(id)))
+        {
+            return Some(t);
+        }
+    }
+    let n = split.name_match.trim().to_lowercase();
+    if !n.is_empty() {
+        return real().find(|t| t.friendly_name.to_lowercase().contains(&n));
+    }
+    None
+}
+
+/// Current refresh rate of a GDI display (`\\.\DISPLAYn`), if known.
+pub fn current_refresh(gdi_name: &str) -> Option<u32> {
+    let name: Vec<u16> = gdi_name.encode_utf16().chain(Some(0)).collect();
+    let mut cur = DEVMODEW {
+        dmSize: size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    unsafe {
+        EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut cur)
+            .as_bool()
+            .then_some(cur.dmDisplayFrequency)
+    }
+}
+
 /// Targets in `after` that were not in `before`.
 pub fn new_targets(before: &[TargetInfo], after: &[TargetInfo]) -> Vec<TargetInfo> {
     after
@@ -256,14 +318,6 @@ pub fn snapshot() -> Result<Snapshot> {
         active: enumerate()?,
         available: available_targets()?,
     })
-}
-
-fn extend_topology() -> Result<()> {
-    let r = unsafe { SetDisplayConfig(None, None, SDC_APPLY | SDC_TOPOLOGY_EXTEND) };
-    if r != 0 {
-        bail!("SetDisplayConfig(SDC_TOPOLOGY_EXTEND) failed: {r}");
-    }
-    Ok(())
 }
 
 /// Fallback activation: append inactive-but-available paths for `new` to the
@@ -345,8 +399,7 @@ fn wait_active(keys: &[TargetKey], timeout: Duration) -> Result<Option<Vec<Targe
 /// After ADD: wait for `count` new connected targets (ALL_PATHS), make sure
 /// they are ACTIVE (Windows may leave them inactive if a persisted topology
 /// for this monitor set says so): first wait briefly for auto-activation, then
-/// SDC_TOPOLOGY_EXTEND, then a manual path injection. Returns the active
-/// targets sorted by target id.
+/// a manual path injection. Returns the active targets sorted by target id.
 pub fn bring_up_new_targets(
     before: &Snapshot,
     count: usize,
@@ -376,14 +429,9 @@ pub fn bring_up_new_targets(
 
     let mut result = wait_active(&new_keys, Duration::from_millis(1500))?;
     if result.is_none() {
-        tracing::warn!("new targets not auto-activated; applying SDC_TOPOLOGY_EXTEND");
-        if let Err(e) = extend_topology() {
-            tracing::warn!("{e}");
-        }
-        result = wait_active(&new_keys, Duration::from_secs(4))?;
-    }
-    if result.is_none() {
-        tracing::warn!("EXTEND did not activate them; injecting paths manually");
+        // No global SDC_TOPOLOGY_EXTEND: it costs seconds and would re-enable
+        // displays the user had turned off. Inject only our paths.
+        tracing::info!("new targets not auto-activated; injecting paths manually");
         activate_manually(&new_keys)?;
         result = wait_active(&new_keys, Duration::from_secs(5))?;
     }
@@ -480,40 +528,6 @@ pub fn set_mode(gdi_name: &str, width: u32, height: u32, hz: u32, pos: (i32, i32
     Ok(())
 }
 
-/// Desired desktop positions for the three roles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Layout {
-    pub v_top: (i32, i32),
-    pub v_bot: (i32, i32),
-    pub physical: (i32, i32),
-}
-
-/// Pure layout computation.
-///
-/// * V-top goes exactly where the physical display currently is (same x, top y).
-/// * V-bot goes directly below V-top (same x).
-/// * The physical display is moved ABOVE the primary, touching only the
-///   primary's top edge, right-aligned. Above (not below) so that the hardware
-///   cursor sprite, which extends down/right from the hotspot, never crosses
-///   into it when the cursor is stopped at the primary's edge. If the primary
-///   is narrower than the physical display it is left-aligned instead.
-pub fn compute_layout(primary: Rect, physical: Rect, v_top_h: i32) -> Layout {
-    let x = (primary.right() - physical.w).max(primary.x);
-    Layout {
-        v_top: (physical.x, physical.y),
-        v_bot: (physical.x, physical.y + v_top_h),
-        physical: (x, primary.y - physical.h),
-    }
-}
-
-/// True if `physical` sits where our layout would have put it (directly above
-/// the primary, right- or left-aligned) - used to warn about a layout left
-/// behind by a killed session.
-pub fn looks_like_our_layout(primary: Rect, physical: Rect) -> bool {
-    physical.bottom() == primary.y
-        && (physical.right() == primary.right() || physical.x == primary.x)
-}
-
 /// True if every key is currently an active target.
 pub fn all_present(keys: &[TargetKey]) -> Result<bool> {
     let now = enumerate()?;
@@ -554,22 +568,14 @@ fn apply_config(cfg: &DisplayConfig) -> Result<()> {
     Ok(())
 }
 
-/// Apply `layout` by editing the source-mode positions of the active config.
-pub fn apply_layout(
-    layout: &Layout,
-    v_top: TargetKey,
-    v_bot: TargetKey,
-    phys: TargetKey,
-) -> Result<()> {
+/// Apply desktop positions by editing the source-mode positions of the
+/// active config. Every key must be an active target.
+pub fn apply_layout(positions: &[(TargetKey, (i32, i32))]) -> Result<()> {
     let mut cfg = query_active_config()?;
-    for (key, (x, y)) in [
-        (v_top, layout.v_top),
-        (v_bot, layout.v_bot),
-        (phys, layout.physical),
-    ] {
-        let m = position_of(&mut cfg, key)?;
-        m.Anonymous.sourceMode.position.x = x;
-        m.Anonymous.sourceMode.position.y = y;
+    for (key, (x, y)) in positions {
+        let m = position_of(&mut cfg, *key)?;
+        m.Anonymous.sourceMode.position.x = *x;
+        m.Anonymous.sourceMode.position.y = *y;
     }
     apply_config(&cfg)
 }
@@ -589,84 +595,84 @@ pub fn restore_layout(saved: &SavedLayout) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn layout_for_current_setup() {
-        let primary = Rect::new(0, 0, 3440, 1440);
-        let physical = Rect::new(-1920, -91, 1920, 2160);
-        let l = compute_layout(primary, physical, 1080);
-        assert_eq!(l.v_top, (-1920, -91));
-        assert_eq!(l.v_bot, (-1920, 989));
-        assert_eq!(l.physical, (1520, -2160));
-
-        let vt = Rect::new(l.v_top.0, l.v_top.1, 1920, 1080);
-        let vb = Rect::new(l.v_bot.0, l.v_bot.1, 1920, 1080);
-        let ph = Rect::new(l.physical.0, l.physical.1, 1920, 2160);
-        for (a, b) in [
-            (vt, vb),
-            (vt, primary),
-            (vb, primary),
-            (ph, primary),
-            (ph, vt),
-            (ph, vb),
-        ] {
-            assert!(!a.intersects(&b), "{a:?} overlaps {b:?}");
-        }
-        // V-top and V-bot are adjacent without gap.
-        assert_eq!(vt.bottom(), vb.y);
-        // Physical touches only the primary's top edge, right-aligned.
-        assert_eq!(ph.bottom(), primary.y);
-        assert_eq!(ph.right(), primary.right());
-        // ...and does not touch the virtual displays (no shared edge either).
-        for v in [vt, vb] {
-            assert!(
-                ph.right() <= v.x || v.right() <= ph.x || ph.bottom() <= v.y || v.bottom() <= ph.y
-            );
-            assert!(ph.x > v.right() || ph.right() < v.x);
-        }
-    }
-
-    #[test]
-    fn narrow_primary_falls_back_to_left_aligned() {
-        let primary = Rect::new(0, 0, 1000, 1440);
-        let physical = Rect::new(-1920, 0, 1920, 2160);
-        let l = compute_layout(primary, physical, 1080);
-        assert_eq!(l.physical, (0, -2160));
-        let ph = Rect::new(l.physical.0, l.physical.1, 1920, 2160);
-        let vt = Rect::new(l.v_top.0, l.v_top.1, 1920, 1080);
-        assert!(!ph.intersects(&vt) && !ph.intersects(&primary));
-    }
-
-    #[test]
-    fn detects_leftover_layout() {
-        let primary = Rect::new(0, 0, 3440, 1440);
-        assert!(looks_like_our_layout(
-            primary,
-            Rect::new(1520, -2160, 1920, 2160)
-        ));
-        assert!(!looks_like_our_layout(
-            primary,
-            Rect::new(-1920, 0, 1920, 2160)
-        ));
-    }
-
-    #[test]
-    fn find_physical_by_substring() {
-        let mk = |n: &str, id| TargetInfo {
+    fn mk(n: &str, id: u32, path: &str) -> TargetInfo {
+        TargetInfo {
             key: TargetKey {
                 luid_low: 1,
                 luid_high: 0,
                 target_id: id,
             },
             friendly_name: n.into(),
-            device_path: String::new(),
+            device_path: path.into(),
             gdi_name: String::new(),
             rect: Rect::new(0, 0, 1, 1),
             hmonitor: 0,
             primary: false,
-        };
-        let t = vec![mk("VG34VQL3A", 1), mk("FlipGo-H", 2)];
+        }
+    }
+
+    fn split(id: &str, name: &str) -> SplitConfig {
+        SplitConfig {
+            display_id: id.into(),
+            name_match: name.into(),
+            ..SplitConfig::default()
+        }
+    }
+
+    #[test]
+    fn display_id_parsing() {
+        assert_eq!(
+            display_id_from_path(r"\\?\DISPLAY#RTK4707#5&1a2b&0&UID4352#{e6f07b5f}"),
+            Some("RTK4707".into())
+        );
+        assert_eq!(display_id_from_path("garbage"), None);
+        assert_eq!(display_id_from_path(""), None);
+        assert_eq!(display_id_from_path(r"\\?\DISPLAY##x"), None);
+    }
+
+    fn setup() -> Vec<TargetInfo> {
+        vec![
+            mk("VG34VQL3A", 1, r"\\?\DISPLAY#AUS1234#5&aa&0&UID1#{g}"),
+            mk("FlipGo-H", 2, r"\\?\DISPLAY#RTK4707#5&bb&0&UID2#{g}"),
+            mk("ParsecVDA", 3, r"\\?\DISPLAY#PSCCDD0#5&cc&0&UID3#{g}"),
+        ]
+    }
+
+    #[test]
+    fn virtual_detection() {
+        let t = setup();
+        assert!(!t[0].is_virtual() && !t[1].is_virtual() && t[2].is_virtual());
+        // by id alone
+        assert!(mk("Generic", 4, r"\\?\DISPLAY#PSCCDD1#x").is_virtual());
+    }
+
+    #[test]
+    fn resolve_by_id_then_name() {
+        let t = setup();
+        let id = |s: &SplitConfig| resolve_split(&t, s).map(|x| x.key.target_id);
+        assert_eq!(id(&split("rtk4707", "")), Some(2));
+        // id wins over a name that matches another display
+        assert_eq!(id(&split("RTK4707", "vg34")), Some(2));
+        // unknown id falls back to the name
+        assert_eq!(id(&split("XXX0000", "flipgo")), Some(2));
+        assert_eq!(id(&split("", "VG34")), Some(1));
+        assert_eq!(id(&split("XXX0000", "")), None);
+        assert_eq!(id(&split("", "")), None);
+    }
+
+    #[test]
+    fn never_resolves_virtual() {
+        let t = setup();
+        assert!(resolve_split(&t, &split("PSCCDD0", "")).is_none());
+        assert!(resolve_split(&t, &split("", "parsec")).is_none());
+    }
+
+    #[test]
+    fn find_physical_by_substring() {
+        let t = setup();
         assert_eq!(find_physical(&t, "flipgo").unwrap().key.target_id, 2);
-        let after = vec![t[0].clone(), t[1].clone(), mk("ParsecVDA", 3)];
+        let mut after = t.clone();
+        after.push(mk("New", 9, ""));
         assert_eq!(new_targets(&t, &after).len(), 1);
     }
 }
