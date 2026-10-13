@@ -191,6 +191,7 @@ It runs in a separate `--settings` process, so its winit loop never touches the 
   - **Status (D): implemented, not committed.** `hotkeys.rs` (parse/format, RegisterHotKey on the tray HWND, ids 1..3, MOD_NOREPEAT, 1409 -> "in use by another app"), `autosplit.rs` (pure `decide` + `AutoState`, 13 tests), tray wiring (WM_DISPLAYCHANGE + WM_DEVICECHANGE debounce 1.5 s, re-armed while the worker is Starting/Stopping). `cargo build`, `--examples`, `--release`, `clippy --all-targets -D warnings`, `fmt --check` clean; `cargo test`: 103 passed (autosplit 13, hotkeys 6, ipc 1, ui 12, +others). Hotkey/auto-split behaviour on the real machine not run (orchestrator e2e).
   - Deviations: `decide(state, running, present, cfg)` takes a mutable `AutoState` (armed-per-split flags: start_on_launch, explicit start, connect with auto_on_connect arm; disconnect and manual stop disarm); a failed start is not retried until display presence changes.
 - **E. Packaging:** README, workflows, LICENSE, version.
+  - **Status (E): implemented, not committed.** README.md rewritten against the real menu labels, flags and config keys; Cargo.toml version 0.2.0 + new description; `.github/workflows/{ci,release}.yml` and `LICENSE` already present. `cargo build` and `cargo test` run after the bump (see report).
 
 Commit after each phase on `VDD-02_generic_split_ui`. No push or PR unless asked.
 

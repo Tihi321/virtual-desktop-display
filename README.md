@@ -1,69 +1,167 @@
-# virtual-desktop-display
+# Virtual Desktop Display
 
-Splits a stacked dual-panel monitor (JSAUX FlipGo) that Windows sees as **one tall 1920x2160 screen** into **two real 1920x1080 monitors**, so maximize, snapping and fullscreen video each fill exactly one panel.
+Split any monitor into several **real virtual monitors** on Windows: columns, rows, a grid or custom ratios. Each piece shows up in Windows (and in Teams, Zoom, OBS, games, the taskbar) as its own display, while the physical monitor keeps showing the combined picture. It uses the Parsec Virtual Display Driver to create the virtual displays.
 
-How it works: two virtual monitors are created with the signed Parsec VDD (IddCx) driver, each is captured with Windows.Graphics.Capture, and a borderless topmost window on the physical FlipGo draws them top and bottom with a D3D11 flip-model swapchain (about 1 frame of latency). A low-level mouse hook keeps the cursor off the hidden physical screen and a WinEvent hook moves windows that land on it to the top virtual monitor.
+## Why
+
+- **Share half of an ultrawide.** Cut a 3440x1440 monitor into two 1720x1440 displays and share just one of them in Teams, Zoom or OBS.
+- **Fullscreen video in one half.** Watch a fullscreen video on one half while you work on the other.
+- **Stacked dual-panel portable monitors on a single cable**, for example the JSAUX FlipGo: Windows sees one tall display, this tool turns it into two normal 1920x1080 monitors.
+- **A 4K TV as a 2x2 grid** of four 1080p monitors.
+
+## How it works
+
+1. The app asks the Parsec VDD driver for virtual displays, one per piece, each sized to its piece.
+2. Each virtual display is captured with Windows.Graphics.Capture and drawn onto the matching part of the real display.
+3. The real display is hidden "behind" the pieces and parked above or to the left of your other displays so it does not get in the way.
+4. A cursor wall keeps the mouse from falling into the hidden real display, and a window rescue moves any window that ends up there onto a piece.
+5. On stop (or exit, or crash recovery) the original layout is restored.
 
 ## Requirements
 
-- Windows 10/11, a GPU with D3D11.
-- [Parsec Virtual Display Driver 0.45](https://builds.parsec.app/vdd/parsec-vdd-0.45.0.0.exe) installed (signed, no test mode needed).
-- The FlipGo connected in its tall single-screen mode (HDMI or DP). Its Windows monitor name must contain `FlipGo` (configurable).
-- Rust 1.80+ and the MSVC build tools to build from source.
+- Windows 10 21H2 or newer, or Windows 11, x64.
+- Parsec Virtual Display Driver 0.45 (see below).
 
-## Build and run
+### Install the driver
 
-```
-cargo build --release
-target\release\virtual-desktop-display.exe        # tray mode
-target\release\virtual-desktop-display.exe --cli  # console mode, Ctrl+C to stop
-target\release\virtual-desktop-display.exe --seconds 30   # console mode, stops itself
-```
+The driver is Parsec's proprietary software. It is **not bundled** with this app. Install it in one of two ways:
 
-Only one instance runs at a time. Logs go to `%APPDATA%\virtual-desktop-display\logs\` (daily files; set `RUST_LOG=debug` for more).
+- In the app: **Settings -> Driver -> Download & install driver**. It downloads the official installer, verifies the Authenticode signature (must be "Parsec Cloud, Inc."), then starts it (UAC prompt).
+- Manually: download <https://builds.parsec.app/vdd/parsec-vdd-0.45.0.0.exe> and run it. Project page: <https://github.com/nomi-san/parsec-vdd>.
+
+## Install the app
+
+- Download `virtual-desktop-display-vX.Y.Z-windows-x64.zip` from [GitHub Releases](https://github.com/Tihi321/virtual-desktop-display/releases), unzip it anywhere and run `virtual-desktop-display.exe`.
+- Or build from source: `cargo build --release` (the exe is in `target\release`).
+
+## Quick start
+
+1. Run the exe. On first run the Settings window opens (afterwards: tray icon, double-click or **Settings...**).
+2. **Splits** tab -> **Add split**.
+3. Pick the **Display** from the dropdown (detected displays are listed with size, and "primary").
+4. Choose a **Layout**: Columns, Rows, Grid or Custom, and the counts. The preview shows the pieces; the table lists each piece's size and whether it is "built-in" or needs a "custom slot".
+5. If a piece needs a custom resolution, open the **Driver** tab and click **Register custom resolutions (admin)** once.
+6. **Save & apply**, then **Start all** (or let it start on launch).
+
+Other options per split: Enabled, Auto-split on connect, piece order (rotate which part each virtual display shows), Main piece (only for the primary display) and Refresh rate. The footer shows the current status. Other tabs: **Hotkeys** and **General** (Start with Windows, Start splitting when the app launches).
+
+## Custom resolutions
+
+Parsec VDD has a built-in list of modes (1920x1080, 2560x1440, 3440x1440, 1280x720, ...). Piece sizes that are not on that list, such as 1720x1440, need a **custom slot**.
+
+- At most **5** custom slots exist in total (stored under `HKLM\SOFTWARE\Parsec\vdd`).
+- Writing them needs administrator rights, so the app asks once through UAC (**Register custom resolutions (admin)**). No driver restart is needed; the modes apply the next time the splits start.
+- This **replaces** any custom modes Parsec already had registered.
+- If more than 5 distinct custom sizes are needed, the app falls back to the nearest larger built-in mode and stretches the picture.
 
 ## Tray menu
 
-- **Start splits / Stop splits**: also toggled by double-clicking the icon.
-- **Cycle pieces**: rotates which virtual monitor is drawn on which piece (a swap for two pieces), live. Saved to the config.
-- **Open config**: opens `config.toml` in Notepad (created with defaults if missing).
-- **Reload config**: re-reads the file and restarts the split if it is running.
-- **Start with Windows**: adds or removes the HKCU `Run` entry `VirtualDesktopDisplay`.
-- **Exit**.
+| Item | Action |
+| --- | --- |
+| Settings... | Open the settings window (also double-click the icon) |
+| One checkable item per split | Enable or disable that split (restarts when running); shows "(not connected)" when missing |
+| Start all / Stop all | Start or stop all enabled splits |
+| Cycle pieces | Rotate the pieces of all running splits |
+| Start with Windows | Toggle startup for the current user |
+| Exit | Stop and restore the layout, then quit |
 
-The split is stopped automatically (layout restored, balloon shown) if the FlipGo or a virtual monitor disappears. After sleep/resume a running split is torn down and started again.
+## Hotkeys
 
-## Config
+| Action | Default | Enabled by default |
+| --- | --- | --- |
+| Toggle splits (start / stop) | `Ctrl+Alt+S` | yes |
+| Cycle pieces | `Ctrl+Alt+W` | yes |
+| Open settings | `Ctrl+Alt+D` | no |
 
-`%APPDATA%\virtual-desktop-display\config.toml` (all keys optional):
+Change or disable them in **Settings -> Hotkeys**: use the master switch "Enable global hotkeys", the per-action Enabled box, and click the key field then press the new combination. A combination needs a modifier (Ctrl, Alt, Shift, Win) unless it is an F-key. After **Save & apply** the status shows registered or "in use by another app" when another program already owns it.
 
-Config v2 (v0.1 files are migrated automatically into one `FlipGo` split with 2 rows; full docs come with the settings UI):
+## Auto-split on connect
 
-| key | default | meaning |
-|---|---|---|
-| `version` | `2` | |
-| `autostart` | `false` | start with Windows (synced to the Run key on launch and reload) |
-| `start_on_launch` | `true` | start the splits as soon as the tray app launches |
-| `[hotkeys]` | | master `enabled` plus `toggle_all`, `cycle_order`, `open_settings` (`keys`, `enabled`); not active yet |
-| `[[splits]]` | none | one table per split: `name`, `enabled`, `auto_on_connect`, `display_id` (e.g. `RTK4707`), `name_match`, `layout` (`columns`/`rows`/`grid`/`custom`), `columns`, `rows`, `ratios_x`, `ratios_y`, `order`, `main_piece`, `refresh_hz` |
+A split with **Auto-split on connect** starts by itself when its display is connected (and stops cleanly when it is unplugged). If you stop a split manually (Stop all, hotkey), it will not restart until that display is unplugged and plugged in again.
 
-Each virtual monitor gets the size of its piece; if a piece size cannot be set exactly, the capture is stretched with a linear-filtered shader.
+## Splitting the main display
 
-## Layout
+You can split the primary display too. The **Main piece** (marked with a star in the preview) becomes the new primary display and carries the taskbar and desktop icons. The other pieces are placed next to it.
 
-While running, the virtual monitors take the physical FlipGo's former place (stacked) and the physical FlipGo is moved above the primary monitor, touching only its top edge, right-aligned (above rather than below so the cursor sprite never bleeds onto it). The layout is applied without `SDC_SAVE_TO_DATABASE`, so if the process is killed the virtual monitors vanish within about a second and Windows falls back to its stored layout. On a normal stop the virtual monitors are removed first and the original layout is then re-applied.
+## Configuration
 
-## Known limitations
+Files live in `%APPDATA%\virtual-desktop-display\`:
 
-- DRM-protected video (for example Netflix in a browser) is black in the capture.
-- About one frame of added latency: fine for video and work, not for competitive games.
-- No touch input forwarding.
-- Cursor portal: the cursor cannot rest on the physical screen. Moving onto it warps the cursor to the matching point on the top (upper half) or bottom (lower half) virtual monitor. Elevated windows (UAC prompts) can bypass the hook while they are focused.
-- Window rescue moves new, dragged or focused windows on the physical monitor to the top virtual monitor (keeping their relative position, clamped to fit); tool windows and the taskbar are left alone.
-- The physical monitor stays part of the desktop (Windows cannot detach it on Pro editions); it is just covered by the renderer window.
-- Manual rearrangement of displays in Settings while the split runs is not tracked.
+- `config.toml`: the settings (edited by the Settings window; manual edits need **Save & apply** or an app restart).
+- `status.json`: written by the tray app (running splits, errors, hotkey registration results, driver state).
+- `logs\`: daily rolling `vdd.log` files.
 
-## Known quirks
+A v0.1 config (`physical_match`, `swap`) is migrated automatically on load.
 
-- The cursor treats the hidden physical display as a wall when moving into it from another monitor (it stops at the edge; sliding along the edge still works). The cursor is only warped onto the virtual monitors if it is already inside the physical rect (for example after Win+Shift+arrow or at startup).
-- Windows Settings > Display > Identify draws the hidden physical display's number (for example "2") over the bottom-left corner of the bottom panel, because system overlays sit above our window. It covers the virtual display's number but is harmless.
+```toml
+version = 2
+autostart = false          # start with Windows
+start_on_launch = true     # start splits when the app launches
+
+[hotkeys]
+enabled = true             # master switch
+toggle_all    = { keys = "Ctrl+Alt+S", enabled = true }
+cycle_order   = { keys = "Ctrl+Alt+W", enabled = true }
+open_settings = { keys = "Ctrl+Alt+D", enabled = false }
+
+[[splits]]
+name = "FlipGo"
+enabled = true
+auto_on_connect = true
+display_id = "RTK4707"     # EDID manufacturer + product, stable across reboots
+name_match = "FlipGo"      # optional fallback: friendly-name substring
+layout = "rows"            # columns | rows | grid | custom
+columns = 1
+rows = 2
+ratios_x = []              # custom only: fractions summing to 1
+ratios_y = []
+order = [0, 1]             # which cell each virtual display shows
+main_piece = 0             # used only when the display is the primary
+refresh_hz = 60
+```
+
+## Command line
+
+| Flag | Meaning |
+| --- | --- |
+| (none) | Tray app |
+| `--settings` | Open only the settings window |
+| `--cli` | Console mode: start the splits, Ctrl+C to stop |
+| `--seconds N` | Like `--cli`, stops after N seconds |
+| `--register-modes "1720x1440@60,..."` | Elevated helper that writes the Parsec custom modes to HKLM and exits |
+
+## Limitations
+
+- About one frame of latency: not suitable for competitive gaming.
+- DRM-protected video (for example some streaming apps) shows black in the capture.
+- No touch input on the pieces.
+- At most 8 virtual displays in total, and at most 5 custom sizes.
+- Starting takes a few seconds per virtual display.
+- The Windows "Identify" overlay may show numbers on the wrong display.
+- HDR is not supported.
+
+## Troubleshooting
+
+- **Displays do not appear:** check Settings -> Driver says "Installed", the split is Enabled and its display is connected (not "(not connected)"), and the total is 8 virtual displays or fewer. Check the latest log in `%APPDATA%\virtual-desktop-display\logs`.
+- **Layout was not restored** (crash or kill): start the app again and choose Stop all, or Exit from the tray. If that is not enough, open Windows Settings -> System -> Display and rearrange or re-enable your monitors.
+- **Hotkey "in use by another app":** another program owns that combination. Pick a different one in Settings -> Hotkeys.
+- **Driver not detected:** install it from Settings -> Driver (or manually), then click **Re-check**. A reboot may be required after the first install.
+
+## Building
+
+```
+cargo build --release
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+Rust (stable, MSVC toolchain) on Windows is required.
+
+## CI and releases
+
+- `.github/workflows/ci.yml` builds, runs clippy and tests on every push and pull request (windows-latest).
+- `.github/workflows/release.yml` runs when you push a tag `vX.Y.Z`. The tag must match the `version` in `Cargo.toml`. It publishes a GitHub Release with `virtual-desktop-display-vX.Y.Z-windows-x64.zip` (exe, README, LICENSE) and a SHA-256 file.
+
+## License
+
+MIT. See [LICENSE](LICENSE). The Parsec Virtual Display Driver is separate software under Parsec's own terms.
