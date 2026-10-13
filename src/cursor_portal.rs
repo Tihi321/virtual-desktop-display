@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread::JoinHandle;
 use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONULL};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -65,7 +66,8 @@ fn inside(r: Rect, p: (i32, i32)) -> bool {
     p.0 >= r.x && p.0 < r.right() && p.1 >= r.y && p.1 < r.bottom()
 }
 
-/// Decide what to do with a move from `prev` to `new`.
+/// Decide what to do with a move from `prev` to `new`. `on_desktop` tells
+/// whether a point is on any display (hidden ones included).
 ///
 /// * Not entering any hidden display: Allow.
 /// * Entering one from outside: it is a WALL; the cursor is put back just
@@ -73,26 +75,58 @@ fn inside(r: Rect, p: (i32, i32)) -> bool {
 ///   along the edge works.
 /// * Already inside (warped there by an app or at startup): mapped onto the
 ///   virtual display of the piece under the point.
-pub fn resolve_move(splits: &[PortalSplit], prev: (i32, i32), new: (i32, i32)) -> Action {
-    let Some(split) = splits.iter().find(|s| inside(s.physical, new)) else {
-        return Action::Allow;
+/// * Off every display, across an edge line a hidden display lies on: also a
+///   wall. Windows would otherwise clamp the cursor or, with "Ease cursor
+///   movement between displays", jump it onto the hidden display, which sits
+///   beside the edge but not straight across it.
+pub fn resolve_move(
+    splits: &[PortalSplit],
+    prev: (i32, i32),
+    new: (i32, i32),
+    on_desktop: impl Fn((i32, i32)) -> bool,
+) -> Action {
+    // Where to stop; when that point is on no display, stay where we were.
+    let stop = |p: (i32, i32)| {
+        let (x, y) = if on_desktop(p) { p } else { prev };
+        Action::MoveTo(x, y)
     };
-    let physical = split.physical;
-    if inside(physical, prev) {
-        return match map_point(split, new) {
-            Some((x, y)) => Action::MoveTo(x, y),
-            None => Action::Allow,
+    if let Some(split) = splits.iter().find(|s| inside(s.physical, new)) {
+        let physical = split.physical;
+        if inside(physical, prev) {
+            return match map_point(split, new) {
+                Some((x, y)) => Action::MoveTo(x, y),
+                None => Action::Allow,
+            };
+        }
+        return if prev.1 < physical.y {
+            stop((new.0, physical.y - 1))
+        } else if prev.1 >= physical.bottom() {
+            stop((new.0, physical.bottom()))
+        } else if prev.0 < physical.x {
+            stop((physical.x - 1, new.1))
+        } else {
+            stop((physical.right(), new.1))
         };
     }
-    if prev.1 < physical.y {
-        Action::MoveTo(new.0, physical.y - 1)
-    } else if prev.1 >= physical.bottom() {
-        Action::MoveTo(new.0, physical.bottom())
-    } else if prev.0 < physical.x {
-        Action::MoveTo(physical.x - 1, new.1)
-    } else {
-        Action::MoveTo(physical.right(), new.1)
+    if on_desktop(new) {
+        return Action::Allow;
     }
+    for split in splits {
+        let p = split.physical;
+        if prev.1 >= p.bottom() && new.1 < p.bottom() {
+            return stop((new.0, p.bottom()));
+        }
+        if prev.1 < p.y && new.1 >= p.y {
+            return stop((new.0, p.y - 1));
+        }
+        if prev.0 >= p.right() && new.0 < p.right() {
+            return stop((p.right(), new.1));
+        }
+        if prev.0 < p.x && new.0 >= p.x {
+            return stop((p.x - 1, new.1));
+        }
+    }
+    Action::Allow
 }
 
 struct State {
@@ -105,18 +139,24 @@ struct State {
 
 impl State {
     fn resolve(&self, prev: (i32, i32), new: (i32, i32)) -> Action {
-        resolve_move(&self.splits, prev, new)
+        resolve_move(&self.splits, prev, new, on_desktop)
     }
 
+    /// Where the cursor is now, before this move. Read from Windows first:
+    /// the last hooked point can be stale when Windows clamped the move or
+    /// eased the cursor onto another display after the hook let it through.
     fn prev(&self) -> Option<(i32, i32)> {
+        let mut p = POINT::default();
+        if unsafe { GetCursorPos(&mut p) }.is_ok() {
+            return Some((p.x, p.y));
+        }
         if self.has_prev.load(Ordering::Relaxed) {
             return Some((
                 self.prev_x.load(Ordering::Relaxed),
                 self.prev_y.load(Ordering::Relaxed),
             ));
         }
-        let mut p = POINT::default();
-        unsafe { GetCursorPos(&mut p) }.ok().map(|_| (p.x, p.y))
+        None
     }
 
     fn set_prev(&self, p: (i32, i32)) {
@@ -124,6 +164,10 @@ impl State {
         self.prev_y.store(p.1, Ordering::Relaxed);
         self.has_prev.store(true, Ordering::Relaxed);
     }
+}
+
+fn on_desktop(p: (i32, i32)) -> bool {
+    !unsafe { MonitorFromPoint(POINT { x: p.0, y: p.1 }, MONITOR_DEFAULTTONULL) }.is_invalid()
 }
 
 static STATE: RwLock<Option<Arc<State>>> = RwLock::new(None);
@@ -254,6 +298,11 @@ mod tests {
         h: 1080,
     };
 
+    /// Every point is on a display (no gaps), as in the wall tests.
+    fn rm(splits: &[PortalSplit], prev: (i32, i32), new: (i32, i32)) -> Action {
+        resolve_move(splits, prev, new, |_| true)
+    }
+
     fn rows(physical: Rect, top: Rect, bot: Rect) -> PortalSplit {
         let half = physical.h / 2;
         PortalSplit {
@@ -336,15 +385,15 @@ mod tests {
     #[test]
     fn outside_to_outside_is_allowed() {
         let s = [rows(PHYS, TOP, BOT)];
-        assert_eq!(resolve_move(&s, (100, 100), (110, 120)), Action::Allow);
-        assert_eq!(resolve_move(&s, (1519, 1439), (1519, 1439)), Action::Allow);
-        assert_eq!(resolve_move(&[], (1, 1), (2, 2)), Action::Allow);
+        assert_eq!(rm(&s, (100, 100), (110, 120)), Action::Allow);
+        assert_eq!(rm(&s, (1519, 1439), (1519, 1439)), Action::Allow);
+        assert_eq!(rm(&[], (1, 1), (2, 2)), Action::Allow);
     }
 
     #[test]
     fn enter_from_top_is_a_wall() {
         let s = [rows(PHYS, TOP, BOT)];
-        let r = |prev, new| resolve_move(&s, prev, new);
+        let r = |prev, new| rm(&s, prev, new);
         // moving down off the Asus at x=2000: stay on the Asus's last row
         assert_eq!(r((2000, 1439), (2000, 1441)), Action::MoveTo(2000, 1439));
         // diagonal: keep the new x so sliding along the edge works
@@ -354,7 +403,7 @@ mod tests {
     #[test]
     fn enter_from_other_sides() {
         let s = [rows(PHYS, TOP, BOT)];
-        let r = |prev, new| resolve_move(&s, prev, new);
+        let r = |prev, new| rm(&s, prev, new);
         assert_eq!(r((1500, 2000), (1530, 2010)), Action::MoveTo(1519, 2010)); // from left
         assert_eq!(r((3450, 2000), (3430, 2005)), Action::MoveTo(3440, 2005)); // from right
         assert_eq!(r((2000, 3605), (2000, 3590)), Action::MoveTo(2000, 3600)); // from below
@@ -364,7 +413,7 @@ mod tests {
     fn enter_from_below_when_physical_is_above() {
         let above = Rect::new(1520, -2160, 1920, 2160);
         let s = [rows(above, TOP, BOT)];
-        let r = |prev, new| resolve_move(&s, prev, new);
+        let r = |prev, new| rm(&s, prev, new);
         // moving up off the primary's top edge: stay on the primary's first row
         assert_eq!(r((2000, 0), (2000, -2)), Action::MoveTo(2000, 0));
         assert_eq!(r((1500, 5), (1530, -3)), Action::MoveTo(1530, 0));
@@ -373,18 +422,15 @@ mod tests {
     #[test]
     fn already_inside_is_mapped() {
         let s = [rows(PHYS, TOP, BOT)];
+        assert_eq!(rm(&s, (2000, 2000), (1520, 1440)), Action::MoveTo(-1920, 0));
         assert_eq!(
-            resolve_move(&s, (2000, 2000), (1520, 1440)),
-            Action::MoveTo(-1920, 0)
-        );
-        assert_eq!(
-            resolve_move(&s, (2000, 2000), (1520, 2520)),
+            rm(&s, (2000, 2000), (1520, 2520)),
             Action::MoveTo(-1920, 1080)
         );
         // the displays are given by piece: exchanging them exchanges the targets
         let swapped = [rows(PHYS, BOT, TOP)];
         assert_eq!(
-            resolve_move(&swapped, (2000, 2000), (1520, 1440)),
+            rm(&swapped, (2000, 2000), (1520, 1440)),
             Action::MoveTo(-1920, 1080)
         );
     }
@@ -400,14 +446,8 @@ mod tests {
         assert_eq!(map_point(&s[0], (-1720, -1440)), Some((1720, 0)));
         assert_eq!(map_point(&s[0], (-1, -1)), Some((3439, 1439)));
         // wall from below (hidden is above its neighbour)
-        assert_eq!(
-            resolve_move(&s, (-2000, 5), (-2000, -3)),
-            Action::MoveTo(-2000, 0)
-        );
-        assert_eq!(
-            resolve_move(&s, (-100, -1), (-100, -1)),
-            Action::MoveTo(3340, 1439)
-        );
+        assert_eq!(rm(&s, (-2000, 5), (-2000, -3)), Action::MoveTo(-2000, 0));
+        assert_eq!(rm(&s, (-100, -1), (-100, -1)), Action::MoveTo(3340, 1439));
     }
 
     #[test]
@@ -438,19 +478,98 @@ mod tests {
         let s = [a, b];
         // inside B: mapped through B only
         assert_eq!(
-            resolve_move(&s, (-5000, -500), (-5000, -500)),
+            rm(&s, (-5000, -500), (-5000, -500)),
             Action::MoveTo(5000 + 1000, 940)
         );
         // wall works per display
         assert_eq!(
-            resolve_move(&s, (2000, 1439), (2000, 1441)),
+            rm(&s, (2000, 1439), (2000, 1441)),
             Action::MoveTo(2000, 1439)
         );
-        assert_eq!(
-            resolve_move(&s, (-5000, 5), (-5000, -5)),
-            Action::MoveTo(-5000, 0)
-        );
+        assert_eq!(rm(&s, (-5000, 5), (-5000, -5)), Action::MoveTo(-5000, 0));
         // between the two hidden displays: free
-        assert_eq!(resolve_move(&s, (0, 0), (10, 10)), Action::Allow);
+        assert_eq!(rm(&s, (0, 0), (10, 10)), Action::Allow);
+    }
+
+    /// The user's v0.2 layout: Asus primary at (0,0); FlipGo pieces where the
+    /// FlipGo was, left of it; the FlipGo parked above the Asus, right-aligned.
+    const ASUS: Rect = Rect {
+        x: 0,
+        y: 0,
+        w: 3440,
+        h: 1440,
+    };
+    const PARKED: Rect = Rect {
+        x: 1520,
+        y: -2160,
+        w: 1920,
+        h: 2160,
+    };
+    const LEFT_TOP: Rect = Rect {
+        x: -1920,
+        y: 0,
+        w: 1920,
+        h: 1080,
+    };
+    const LEFT_BOT: Rect = Rect {
+        x: -1920,
+        y: 1080,
+        w: 1920,
+        h: 1080,
+    };
+
+    fn on_user_desktop(p: (i32, i32)) -> bool {
+        [ASUS, PARKED, LEFT_TOP, LEFT_BOT]
+            .iter()
+            .any(|r| inside(*r, p))
+    }
+
+    fn user(prev: (i32, i32), new: (i32, i32)) -> Action {
+        resolve_move(
+            &[rows(PARKED, LEFT_TOP, LEFT_BOT)],
+            prev,
+            new,
+            on_user_desktop,
+        )
+    }
+
+    #[test]
+    fn up_into_the_gap_beside_the_parked_display_is_a_wall() {
+        // Up off the Asus left of the parked FlipGo: Windows would ease the
+        // cursor onto the FlipGo; stop on the Asus's first row instead.
+        assert_eq!(user((500, 0), (500, -3)), Action::MoveTo(500, 0));
+        assert_eq!(user((1519, 2), (1519, -40)), Action::MoveTo(1519, 0));
+        // also up off the FlipGo pieces, whose top is the same edge line
+        assert_eq!(user((-500, 0), (-500, -1)), Action::MoveTo(-500, 0));
+    }
+
+    #[test]
+    fn up_into_the_parked_display_is_a_wall() {
+        assert_eq!(user((2000, 0), (2000, -2)), Action::MoveTo(2000, 0));
+        // diagonal from the gap side
+        assert_eq!(user((1500, 1), (1530, -3)), Action::MoveTo(1530, 0));
+    }
+
+    #[test]
+    fn wall_target_off_every_display_keeps_the_cursor() {
+        // Coming at the parked display from the empty space on its left
+        // (cursor already in the gap): the spot left of it is on no display.
+        assert_eq!(user((1510, -5), (1525, -6)), Action::MoveTo(1510, -5));
+    }
+
+    #[test]
+    fn already_on_the_parked_display_goes_to_the_piece() {
+        // Eased there anyway: the next move maps it onto the bottom piece.
+        assert_eq!(user((1520, -1), (1525, -3)), Action::MoveTo(-1915, 2157));
+    }
+
+    #[test]
+    fn moves_between_visible_displays_are_free() {
+        assert_eq!(user((0, 500), (-3, 500)), Action::Allow);
+        assert_eq!(user((-3, 1200), (2, 1200)), Action::Allow);
+        // off the bottom: no hidden display on that edge, Windows clamps
+        assert_eq!(user((500, 1439), (500, 1442)), Action::Allow);
+        // right of the pieces below the Asus: not an edge of the parked display
+        assert_eq!(user((-1, 1800), (3, 1800)), Action::Allow);
     }
 }
