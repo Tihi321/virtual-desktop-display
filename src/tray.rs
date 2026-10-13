@@ -3,7 +3,7 @@
 use crate::autostart;
 use crate::capture::init_winrt;
 use crate::config::Config;
-use crate::session::Session;
+use crate::session_worker::{Command, SessionWorker, Status, WM_WORKER_STATUS};
 use anyhow::{anyhow, Result};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -28,7 +28,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_START_INITIAL: u32 = WM_APP + 2;
 
 const ID_TOGGLE: usize = 1001;
-const ID_SWAP: usize = 1002;
+const ID_CYCLE: usize = 1002;
 const ID_OPEN_CONFIG: usize = 1003;
 const ID_RELOAD: usize = 1004;
 const ID_AUTOSTART: usize = 1005;
@@ -44,9 +44,10 @@ const PBT_APMRESUMESUSPEND: usize = 0x7;
 struct App {
     hwnd: Cell<HWND>,
     cfg: RefCell<Config>,
-    session: RefCell<Option<Session>>,
-    /// A start/stop is in progress (window messages may re-enter).
-    busy: Cell<bool>,
+    /// Owns the session; all start/stop work happens on its thread.
+    worker: RefCell<Option<SessionWorker>>,
+    /// Last worker status the UI reacted to.
+    last_status: RefCell<Status>,
     /// The session was running when the machine went to sleep.
     resume_restart: Cell<bool>,
     taskbar_created: Cell<u32>,
@@ -89,11 +90,32 @@ fn nid(hwnd: HWND) -> NOTIFYICONDATAW {
     }
 }
 
-fn tip_text(running: bool) -> String {
-    if running {
-        "Virtual Desktop Display - split active".into()
-    } else {
-        "Virtual Desktop Display - stopped".into()
+fn tip_text(status: &Status) -> String {
+    match status {
+        Status::Running { splits } => {
+            format!("Virtual Desktop Display - {} split(s) active", splits.len())
+        }
+        Status::Starting => "Virtual Desktop Display - starting...".into(),
+        Status::Stopping => "Virtual Desktop Display - stopping...".into(),
+        _ => "Virtual Desktop Display - stopped".into(),
+    }
+}
+
+fn status(app: &App) -> Status {
+    app.worker
+        .borrow()
+        .as_ref()
+        .map(|w| w.status())
+        .unwrap_or(Status::Idle)
+}
+
+fn is_active(app: &App) -> bool {
+    status(app).is_active()
+}
+
+fn send(app: &App, cmd: Command) {
+    if let Some(w) = app.worker.borrow().as_ref() {
+        w.send(cmd);
     }
 }
 
@@ -102,7 +124,7 @@ fn add_tray_icon(app: &App) {
     d.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     d.uCallbackMessage = WM_TRAY;
     d.hIcon = load_icon();
-    copy_wide(&mut d.szTip, &tip_text(app.session.borrow().is_some()));
+    copy_wide(&mut d.szTip, &tip_text(&status(app)));
     unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &d);
     }
@@ -111,7 +133,7 @@ fn add_tray_icon(app: &App) {
 fn update_tip(app: &App) {
     let mut d = nid(app.hwnd.get());
     d.uFlags = NIF_TIP;
-    copy_wide(&mut d.szTip, &tip_text(app.session.borrow().is_some()));
+    copy_wide(&mut d.szTip, &tip_text(&status(app)));
     unsafe {
         let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
     }
@@ -129,57 +151,42 @@ fn balloon(app: &App, title: &str, text: &str, warning: bool) {
 }
 
 fn start_session(app: &App) {
-    if app.busy.get() || app.session.borrow().is_some() {
+    if is_active(app) {
         return;
     }
-    app.busy.set(true);
     let cfg = app.cfg.borrow().clone();
-    let r = Session::start(&cfg);
-    app.busy.set(false);
-    match r {
-        Ok(s) => {
-            *app.session.borrow_mut() = Some(s);
-            update_tip(app);
-        }
-        Err(e) => {
-            tracing::error!("start failed: {e:#}");
-            balloon(app, "Could not start split", &format!("{e:#}"), true);
-        }
-    }
+    send(app, Command::Start(Box::new(cfg)));
 }
 
 fn stop_session(app: &App) {
-    if app.busy.get() {
-        return;
+    send(app, Command::Stop);
+}
+
+/// Stop the session and end the worker thread, waiting for it (exit paths).
+fn shutdown_worker(app: &App) {
+    let w = app.worker.borrow_mut().take();
+    if let Some(w) = w {
+        w.shutdown();
     }
-    let s = app.session.borrow_mut().take();
-    if let Some(mut s) = s {
-        app.busy.set(true);
-        s.stop();
-        drop(s);
-        app.busy.set(false);
-    }
-    update_tip(app);
 }
 
 fn show_menu(app: &App) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let running = app.session.borrow().is_some();
+        let running = is_active(app);
         let check = |b: bool| if b { MF_CHECKED } else { MF_UNCHECKED };
-        let toggle = wide(if running { "Stop split" } else { "Start split" });
-        let swap = wide("Swap top/bottom");
+        let toggle = wide(if running {
+            "Stop splits"
+        } else {
+            "Start splits"
+        });
+        let cycle = wide("Cycle pieces");
         let open = wide("Open config");
         let reload = wide("Reload config");
         let auto = wide("Start with Windows");
         let exit = wide("Exit");
         let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE, PCWSTR(toggle.as_ptr()));
-        let _ = AppendMenuW(
-            menu,
-            MF_STRING | check(app.cfg.borrow().swap),
-            ID_SWAP,
-            PCWSTR(swap.as_ptr()),
-        );
+        let _ = AppendMenuW(menu, MF_STRING, ID_CYCLE, PCWSTR(cycle.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, PCWSTR(open.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, ID_RELOAD, PCWSTR(reload.as_ptr()));
@@ -238,44 +245,56 @@ fn reload_config(app: &App) {
     if let Err(e) = autostart::set_enabled(new.autostart) {
         tracing::warn!("autostart sync failed: {e:#}");
     }
-    *app.cfg.borrow_mut() = new;
-    if app.session.borrow().is_some() {
-        stop_session(app);
-        start_session(app);
+    *app.cfg.borrow_mut() = new.clone();
+    // The worker restarts a running session with the new config.
+    if is_active(app) {
+        send(app, Command::Start(Box::new(new)));
     }
 }
 
-fn toggle_swap(app: &App) {
-    let new = !app.cfg.borrow().swap;
-    {
-        let mut cfg = app.cfg.borrow_mut();
-        cfg.swap = new;
-        if let Err(e) = cfg.save() {
-            tracing::warn!("could not save config: {e:#}");
-        }
+fn cycle_pieces(app: &App) {
+    if matches!(status(app), Status::Running { .. }) {
+        send(app, Command::CycleAll);
     }
-    if app.busy.get() {
+}
+
+/// React to a worker status change: tooltip, balloon on errors, and persist
+/// the piece orders after a cycle.
+fn on_worker_status(app: &App) {
+    let st = status(app);
+    if *app.last_status.borrow() == st {
         return;
     }
-    // Take the session out while it is busy so re-entrant messages see no session.
-    let taken = app.session.borrow_mut().take();
-    let Some(mut s) = taken else { return };
-    app.busy.set(true);
-    let r = s.set_swap(new);
-    app.busy.set(false);
-    match r {
-        Ok(()) => *app.session.borrow_mut() = Some(s),
-        Err(e) => {
-            // set_swap already stopped the whole session cleanly.
-            tracing::error!("swap failed: {e:#}");
-            drop(s);
-            update_tip(app);
-            balloon(
-                app,
-                "Swap failed",
-                &format!("{e:#}; the split was stopped."),
-                true,
-            );
+    *app.last_status.borrow_mut() = st.clone();
+    update_tip(app);
+    match st {
+        Status::Error(msg) => balloon(app, "Split stopped", &msg, true),
+        Status::Running { .. } => persist_orders(app),
+        _ => {}
+    }
+}
+
+/// Save the worker's current piece orders into the config if they changed.
+fn persist_orders(app: &App) {
+    let orders = app
+        .worker
+        .borrow()
+        .as_ref()
+        .map(|w| w.orders())
+        .unwrap_or_default();
+    let mut cfg = app.cfg.borrow_mut();
+    let mut changed = false;
+    for (i, o) in orders {
+        if let Some(sc) = cfg.splits.get_mut(i) {
+            if sc.order != o {
+                sc.order = o;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        if let Err(e) = cfg.save() {
+            tracing::warn!("could not save config: {e:#}");
         }
     }
 }
@@ -295,22 +314,8 @@ fn toggle_autostart(app: &App) {
 }
 
 fn check_health(app: &App) {
-    if app.busy.get() {
-        return;
-    }
-    let healthy = match app.session.borrow().as_ref() {
-        Some(s) => s.is_healthy(),
-        None => return,
-    };
-    if !healthy {
-        tracing::warn!("display configuration changed: a required display is gone; stopping");
-        stop_session(app);
-        balloon(
-            app,
-            "Split stopped",
-            "The FlipGo or a virtual display disappeared; the layout was restored.",
-            true,
-        );
+    if matches!(status(app), Status::Running { .. }) {
+        send(app, Command::CheckHealth);
     }
 }
 
@@ -323,7 +328,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             match (lp.0 as u32) & 0xFFFF {
                 WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(&app),
                 WM_LBUTTONDBLCLK => {
-                    if app.session.borrow().is_some() {
+                    if is_active(&app) {
                         stop_session(&app);
                     } else {
                         start_session(&app);
@@ -336,18 +341,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_COMMAND => {
             match wp.0 & 0xFFFF {
                 ID_TOGGLE => {
-                    if app.session.borrow().is_some() {
+                    if is_active(&app) {
                         stop_session(&app);
                     } else {
                         start_session(&app);
                     }
                 }
-                ID_SWAP => toggle_swap(&app),
+                ID_CYCLE => cycle_pieces(&app),
                 ID_OPEN_CONFIG => open_config(&app),
                 ID_RELOAD => reload_config(&app),
                 ID_AUTOSTART => toggle_autostart(&app),
                 ID_EXIT => {
-                    stop_session(&app);
+                    shutdown_worker(&app);
                     let _ = DestroyWindow(hwnd);
                 }
                 _ => {}
@@ -356,6 +361,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_START_INITIAL => {
             start_session(&app);
+            LRESULT(0)
+        }
+        WM_WORKER_STATUS => {
+            on_worker_status(&app);
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
@@ -374,7 +383,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let _ = KillTimer(Some(hwnd), TIMER_RESUME);
                     if app.resume_restart.replace(false) {
                         tracing::info!("resume: restarting session");
-                        start_session(&app);
+                        // Queued behind the Stop sent on resume, so order is safe.
+                        let cfg = app.cfg.borrow().clone();
+                        send(&app, Command::Start(Box::new(cfg)));
                     }
                 }
                 _ => {}
@@ -384,13 +395,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_POWERBROADCAST => {
             match wp.0 {
                 PBT_APMSUSPEND => {
-                    if app.session.borrow().is_some() {
+                    if is_active(&app) {
                         tracing::info!("suspend: session will be restarted on resume");
                         app.resume_restart.set(true);
                     }
                 }
                 PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND
-                    if app.resume_restart.get() && app.session.borrow().is_some() =>
+                    if app.resume_restart.get() && is_active(&app) =>
                 {
                     // The virtual displays vanished while the keep-alive was
                     // frozen; tear the stale session down, then start fresh.
@@ -404,7 +415,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_ENDSESSION => {
             if wp.0 != 0 {
-                stop_session(&app);
+                shutdown_worker(&app);
             }
             LRESULT(0)
         }
@@ -426,12 +437,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 pub fn run(cfg: Config) -> Result<()> {
     init_winrt();
     let start_on_launch = cfg.start_on_launch;
+    let has_splits = !cfg.splits.is_empty();
     let autostart_wanted = cfg.autostart;
     let app = Rc::new(App {
         hwnd: Cell::new(HWND::default()),
         cfg: RefCell::new(cfg),
-        session: RefCell::new(None),
-        busy: Cell::new(false),
+        worker: RefCell::new(None),
+        last_status: RefCell::new(Status::Idle),
         resume_restart: Cell::new(false),
         taskbar_created: Cell::new(0),
     });
@@ -468,6 +480,7 @@ pub fn run(cfg: Config) -> Result<()> {
             None,
         )?;
         app.hwnd.set(hwnd);
+        *app.worker.borrow_mut() = Some(SessionWorker::for_hwnd(hwnd.0 as isize)?);
         add_tray_icon(&app);
         // Only ensure the entry exists; never delete it implicitly at startup.
         if autostart_wanted {
@@ -475,7 +488,7 @@ pub fn run(cfg: Config) -> Result<()> {
                 tracing::warn!("autostart sync failed: {e:#}");
             }
         }
-        if start_on_launch {
+        if start_on_launch && has_splits {
             let _ = PostMessageW(Some(hwnd), WM_START_INITIAL, WPARAM(0), LPARAM(0));
         }
         let mut msg = MSG::default();
@@ -485,7 +498,7 @@ pub fn run(cfg: Config) -> Result<()> {
         }
     }
     // Safety net if the loop ended without Exit.
-    stop_session(&app);
+    shutdown_worker(&app);
     APP.with(|a| *a.borrow_mut() = None);
     Ok(())
 }

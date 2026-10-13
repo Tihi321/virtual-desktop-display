@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use vdd_app::{config::Config, session::Session, set_dpi_aware, tray};
+use vdd_app::{config::Config, displays, session, session::Session, set_dpi_aware, tray};
 use windows::core::{w, BOOL};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::System::Console::{
@@ -95,7 +95,17 @@ fn main() -> Result<()> {
 
     unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), true)? };
     let deadline = seconds.map(|n| std::time::Instant::now() + Duration::from_secs(n));
-    let mut session = Session::start(&cfg)?;
+    let targets = displays::enumerate()?;
+    let resolved = session::resolve_all(&cfg, &targets);
+    for r in &resolved {
+        tracing::info!(
+            "split {} -> {} ({} pieces)",
+            r.index,
+            r.physical.friendly_name,
+            r.pieces_rel.len()
+        );
+    }
+    let mut session = Session::start(&cfg, resolved)?;
     tracing::info!("running; press Ctrl+C to stop");
     while !STOP.load(Ordering::SeqCst) && deadline.is_none_or(|d| std::time::Instant::now() < d) {
         std::thread::sleep(Duration::from_millis(100));

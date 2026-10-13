@@ -24,8 +24,8 @@ Only one instance runs at a time. Logs go to `%APPDATA%\virtual-desktop-display\
 
 ## Tray menu
 
-- **Start split / Stop split**: also toggled by double-clicking the icon.
-- **Swap top/bottom**: switches which virtual monitor is drawn on which panel, live. Saved to the config.
+- **Start splits / Stop splits**: also toggled by double-clicking the icon.
+- **Cycle pieces**: rotates which virtual monitor is drawn on which piece (a swap for two pieces), live. Saved to the config.
 - **Open config**: opens `config.toml` in Notepad (created with defaults if missing).
 - **Reload config**: re-reads the file and restarts the split if it is running.
 - **Start with Windows**: adds or removes the HKCU `Run` entry `VirtualDesktopDisplay`.
@@ -37,16 +37,17 @@ The split is stopped automatically (layout restored, balloon shown) if the FlipG
 
 `%APPDATA%\virtual-desktop-display\config.toml` (all keys optional):
 
+Config v2 (v0.1 files are migrated automatically into one `FlipGo` split with 2 rows; full docs come with the settings UI):
+
 | key | default | meaning |
 |---|---|---|
-| `physical_match` | `"FlipGo"` | substring of the physical monitor's friendly name |
-| `width`, `height` | `1920`, `1080` | mode of each virtual monitor |
-| `refresh_hz` | `60` | refresh rate of the virtual monitors |
-| `swap` | `false` | draw the second virtual monitor on the upper panel |
+| `version` | `2` | |
 | `autostart` | `false` | start with Windows (synced to the Run key on launch and reload) |
-| `start_on_launch` | `true` | start the split as soon as the tray app launches |
+| `start_on_launch` | `true` | start the splits as soon as the tray app launches |
+| `[hotkeys]` | | master `enabled` plus `toggle_all`, `cycle_order`, `open_settings` (`keys`, `enabled`); not active yet |
+| `[[splits]]` | none | one table per split: `name`, `enabled`, `auto_on_connect`, `display_id` (e.g. `RTK4707`), `name_match`, `layout` (`columns`/`rows`/`grid`/`custom`), `columns`, `rows`, `ratios_x`, `ratios_y`, `order`, `main_piece`, `refresh_hz` |
 
-If the physical size is not `width` x `2*height`, each half is stretched with a linear-filtered shader.
+Each virtual monitor gets the size of its piece; if a piece size cannot be set exactly, the capture is stretched with a linear-filtered shader.
 
 ## Layout
 

@@ -2,7 +2,7 @@
 name = "virtual-desktop-display"
 version = "0.1.0"
 edition = "2021"
-description = "Split a FlipGo stacked monitor into two virtual 1920x1080 displays"
+description = "Split any display into several virtual displays"
 
 [lib]
 name = "vdd_app"
