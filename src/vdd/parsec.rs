@@ -146,7 +146,7 @@ fn vdd_ioctl(dev: &DevHandle, code: u32, data: &[u8]) -> Result<u32> {
     // Keep-alive pings are too chatty to log unless slow.
     if code != VDD_IOCTL_UPDATE {
         tracing::info!("parsec-vdd ioctl {code:#x} took {ms} ms -> {r:?}");
-    } else if ms > 200 {
+    } else if ms > 500 {
         tracing::warn!("parsec-vdd keep-alive UPDATE took {ms} ms");
     }
     r

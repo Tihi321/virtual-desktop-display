@@ -11,11 +11,11 @@ use windows::Win32::Devices::Display::{
     QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS, QUERY_DISPLAY_CONFIG_FLAGS, SDC_ALLOW_CHANGES, SDC_APPLY,
     SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
-use windows::Win32::Foundation::{LPARAM, LUID, RECT};
+use windows::Win32::Foundation::{LPARAM, LUID, POINTL, RECT};
 use windows::Win32::Graphics::Gdi::{
-    ChangeDisplaySettingsExW, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW,
-    CDS_UPDATEREGISTRY, DEVMODEW, DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT,
-    DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    ChangeDisplaySettingsExW, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, CDS_TYPE,
+    DEVMODEW, DEVMODEW_0, DEVMODEW_0_1, DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT,
+    DM_PELSWIDTH, DM_POSITION, ENUM_CURRENT_SETTINGS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,7 +429,7 @@ pub fn wait_targets_gone(keys: &[TargetKey], timeout: Duration) -> bool {
 }
 
 /// Set `gdi_name` to width x height @ hz if not already.
-pub fn set_mode(gdi_name: &str, width: u32, height: u32, hz: u32) -> Result<()> {
+pub fn set_mode(gdi_name: &str, width: u32, height: u32, hz: u32, pos: (i32, i32)) -> Result<()> {
     let name: Vec<u16> = gdi_name.encode_utf16().chain(Some(0)).collect();
     unsafe {
         let mut cur = DEVMODEW {
@@ -445,7 +445,13 @@ pub fn set_mode(gdi_name: &str, width: u32, height: u32, hz: u32) -> Result<()> 
         }
         let dm = DEVMODEW {
             dmSize: size_of::<DEVMODEW>() as u16,
-            dmFields: DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY,
+            dmFields: DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY,
+            Anonymous1: DEVMODEW_0 {
+                Anonymous2: DEVMODEW_0_1 {
+                    dmPosition: POINTL { x: pos.0, y: pos.1 },
+                    ..Default::default()
+                },
+            },
             dmPelsWidth: width,
             dmPelsHeight: height,
             dmDisplayFrequency: hz,
@@ -455,8 +461,14 @@ pub fn set_mode(gdi_name: &str, width: u32, height: u32, hz: u32) -> Result<()> 
             PCWSTR(name.as_ptr()),
             Some(&dm),
             None,
-            CDS_UPDATEREGISTRY,
+            // Dynamic change (no CDS_UPDATEREGISTRY); DM_POSITION attaches a
+            // source that was injected without a desktop position.
+            CDS_TYPE(0),
             None,
+        );
+        tracing::info!(
+            "ChangeDisplaySettingsExW({gdi_name}, {width}x{height}@{hz} at {pos:?}) -> {}",
+            r.0
         );
         if r != DISP_CHANGE_SUCCESSFUL {
             bail!(

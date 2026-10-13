@@ -13,14 +13,72 @@ use crate::capture::{init_winrt, FrameEvent, MonitorCapture};
 use crate::config::Config;
 use crate::cursor_portal::CursorPortal;
 use crate::displays::{self, SavedLayout, TargetInfo, TargetKey};
-use crate::renderer::{create_device, RenderConfig, Renderer};
+use crate::renderer::{create_device, D3d, RenderConfig, Renderer};
 use crate::vdd::parsec::{ParsecVdd, VDD_DISPLAY_NAME};
 use crate::vdd::VirtualDisplays;
 use crate::window_rescue::WindowRescue;
 use anyhow::{anyhow, Context, Result};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+struct Settled {
+    v_top: TargetInfo,
+    v_bot: TargetInfo,
+    physical: TargetInfo,
+    cap_top: Arc<MonitorCapture>,
+    cap_bot: Arc<MonitorCapture>,
+}
+
+/// One attempt: re-enumerate, require the three targets to be active at the
+/// expected rects with valid HMONITORs, then start both captures. Any failure
+/// (including CreateForMonitor E_INVALIDARG on a not-yet-attached monitor)
+/// returns Err so the caller can retry.
+fn try_capture(
+    cfg: &Config,
+    layout: &displays::Layout,
+    keys: [TargetKey; 3],
+    d3d: &D3d,
+    event: &Arc<FrameEvent>,
+) -> Result<Settled> {
+    let after = displays::enumerate()?;
+    let find = |k: TargetKey, pos: (i32, i32), size: Option<(i32, i32)>| -> Result<TargetInfo> {
+        let t = after
+            .iter()
+            .find(|t| t.key == k)
+            .ok_or_else(|| anyhow!("target {k:?} not active yet"))?;
+        if t.hmonitor == 0 {
+            return Err(anyhow!("target {k:?} has no HMONITOR yet"));
+        }
+        if (t.rect.x, t.rect.y) != pos || size.is_some_and(|sz| (t.rect.w, t.rect.h) != sz) {
+            return Err(anyhow!("target {k:?} at {:?}, expected {pos:?}", t.rect));
+        }
+        Ok(t.clone())
+    };
+    let vsize = Some((cfg.width as i32, cfg.height as i32));
+    let v_top = find(keys[0], layout.v_top, vsize)?;
+    let v_bot = find(keys[1], layout.v_bot, vsize)?;
+    let physical = find(keys[2], layout.physical, None)?;
+    let cap_top = Arc::new(MonitorCapture::start(
+        &d3d.device,
+        &d3d.context,
+        v_top.hmonitor,
+        event.clone(),
+    )?);
+    let cap_bot = Arc::new(MonitorCapture::start(
+        &d3d.device,
+        &d3d.context,
+        v_bot.hmonitor,
+        event.clone(),
+    )?);
+    Ok(Settled {
+        v_top,
+        v_bot,
+        physical,
+        cap_top,
+        cap_bot,
+    })
+}
 
 pub struct Session {
     rescue: Option<WindowRescue>,
@@ -115,7 +173,13 @@ impl Session {
             cfg.refresh_hz
         );
         for t in [&top, &bot] {
-            displays::set_mode(&t.gdi_name, cfg.width, cfg.height, cfg.refresh_hz)?;
+            displays::set_mode(
+                &t.gdi_name,
+                cfg.width,
+                cfg.height,
+                cfg.refresh_hz,
+                (t.rect.x, t.rect.y),
+            )?;
         }
 
         tracing::info!("step 4: applying layout");
@@ -123,42 +187,33 @@ impl Session {
         tracing::info!("layout: {layout:?}");
         displays::apply_layout(&layout, top.key, bot.key, physical.key)?;
 
-        tracing::info!("step 5: re-enumerating");
-        let after = displays::enumerate()?;
-        let find = |k| {
-            after
-                .iter()
-                .find(|t| t.key == k)
-                .cloned()
-                .ok_or_else(|| anyhow!("target {k:?} vanished after layout"))
+        tracing::info!("step 5/6: waiting for the topology to settle, then capture");
+        let d3d = create_device()?;
+        let event = FrameEvent::new()?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let settled = loop {
+            match try_capture(cfg, &layout, [top.key, bot.key, physical.key], &d3d, &event) {
+                Ok(v) => break v,
+                Err(e) if Instant::now() < deadline => {
+                    tracing::info!("not ready, retrying: {e:#}");
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) => return Err(e),
+            }
         };
-        s.v_top = find(top.key)?;
-        s.v_bot = find(bot.key)?;
-        s.physical = find(physical.key)?;
+        s.v_top = settled.v_top;
+        s.v_bot = settled.v_bot;
+        s.physical = settled.physical;
         tracing::info!(
             "v_top {:?}, v_bot {:?}, physical {:?}",
             s.v_top.rect,
             s.v_bot.rect,
             s.physical.rect
         );
-
-        tracing::info!("step 6: capture + renderer");
-        let d3d = create_device()?;
-        let event = FrameEvent::new()?;
-        let cap_top = Arc::new(MonitorCapture::start(
-            &d3d.device,
-            &d3d.context,
-            s.v_top.hmonitor,
-            event.clone(),
-        )?);
+        let (cap_top, cap_bot) = (settled.cap_top, settled.cap_bot);
         s.captures.push(cap_top.clone());
-        let cap_bot = Arc::new(MonitorCapture::start(
-            &d3d.device,
-            &d3d.context,
-            s.v_bot.hmonitor,
-            event.clone(),
-        )?);
         s.captures.push(cap_bot.clone());
+        tracing::info!("step 6: renderer");
         let renderer = Renderer::start(
             &d3d,
             RenderConfig {
